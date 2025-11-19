@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import SessionPasswordNeeded
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
 
 # Environment variables
 API_ID = int(os.environ['API_ID'])
@@ -142,11 +142,9 @@ To create a Telegram session, send your details in this format:
             
             me = await self.client.get_me()
             logger.info(f"Bot started successfully: @{me.username}")
-            
-            # ✅ FIXED: Startup message ko remove kar diya
             logger.info(f"Bot @{me.username} is now running and ready to receive commands")
             
-            # ✅ FIXED: Pyrogram v2.0 mein idle() use karo
+            # Keep bot running
             await idle()
             
         except Exception as e:
@@ -219,7 +217,8 @@ To create a Telegram session, send your details in this format:
             user_client = Client(session_name, api_id=api_id, api_hash=api_hash)
             await user_client.connect()
             
-            if not await user_client.is_user_authorized():
+            # ✅ FIXED: Pyrogram v2.0 compatible - is_authorized use karo
+            if not await user_client.is_authorized():
                 # Send verification code
                 sent_code = await user_client.send_code(phone)
                 user_state['phone_code_hash'] = sent_code.phone_code_hash
@@ -269,6 +268,15 @@ To create a Telegram session, send your details in this format:
                     "🔐 **Two-Factor Authentication Enabled**\n\nPlease enter your 2FA password:"
                 )
                 user_state['step'] = 'waiting_password'
+            except (PhoneCodeInvalid, PhoneCodeExpired):
+                await self.client.send_message(
+                    user_id,
+                    "❌ **Invalid or expired code!**\nPlease start over with /start"
+                )
+                if user_id in self.user_states:
+                    if 'client' in user_state:
+                        await user_state['client'].disconnect()
+                    del self.user_states[user_id]
                 
         except Exception as e:
             logger.error(f"Verification processing error: {e}")
@@ -530,7 +538,7 @@ To create a Telegram session, send your details in this format:
                     self.mark_message_processed(signature, cc, result)
                     await asyncio.sleep(NEXT_POST_DELAY)
             
-            # ✅ FIXED: Pyrogram v2.0 compatible
+            # Keep monitoring running
             await idle()
             
         except Exception as e:
