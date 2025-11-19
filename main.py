@@ -46,20 +46,46 @@ async def handle_login_input(client, message):
     
     print(f"📨 Received from user {user_id}: {text}")
     
-    # Check for confirmation code (5-6 digits)
-    if text.isdigit() and 5 <= len(text) <= 6:
+    # Welcome message
+    if text.lower() in ['/start', '/help', 'start', 'help']:
+        await message.reply(
+            "🤖 **Login Assistant Bot**\n\n"
+            "📱 **Steps to Login:**\n"
+            "1. You will receive a 5-digit code on Telegram\n"
+            "2. Send that code here\n"
+            "3. If you have 2FA password, send that too\n\n"
+            "🔢 **Now send your 5-digit confirmation code:**"
+        )
+        return
+    
+    # Check for confirmation code (5 digits)
+    if text.isdigit() and len(text) == 5:
         login_data['code'] = text
-        await message.reply("✅ Confirmation code received! Processing login...")
+        await message.reply(
+            "✅ **Code Received!**\n"
+            "🔄 Verifying code and logging in...\n"
+            "Please wait 10-15 seconds..."
+        )
         login_data['code_event'].set()
     
     # Check for password
-    elif len(text) >= 4:
+    elif len(text) >= 4 and not text.isdigit():
         login_data['password'] = text
-        await message.reply("✅ Password received! Completing login...")
+        await message.reply(
+            "✅ **Password Received!**\n"
+            "🔐 Verifying 2FA password...\n"
+            "Please wait 10-15 seconds..."
+        )
         login_data['password_event'].set()
     
     else:
-        await message.reply("❌ Please send:\n• 5-6 digit confirmation code\n• Or your 2FA password")
+        await message.reply(
+            "❌ **Invalid Input**\n\n"
+            "Please send:\n"
+            "• 🔢 5-digit confirmation code (e.g., 12345)\n"
+            "• Or your 🔐 2FA password\n\n"
+            "📱 You should receive the code on your Telegram app shortly."
+        )
 
 async def send_code_request():
     """Bot se code request bheje"""
@@ -67,10 +93,25 @@ async def send_code_request():
     print("=" * 60)
     print("🔐 LOGIN REQUIRED - BOT ASSISTANCE")
     print("=" * 60)
-    print(f"🤖 Send confirmation code to: @{bot_me.username}")
+    print(f"🤖 Bot Username: @{bot_me.username}")
     print("📱 You will receive code via Telegram app")
-    print("💬 Forward that code to the bot")
+    print("💬 Send that code to the bot")
     print("=" * 60)
+    
+    # Bot ko startup message bheje
+    try:
+        await bot_app.send_message(
+            chat_id=os.environ.get('ADMIN_USER_ID', 'me'),
+            text=(
+                "🚀 **Telegram Monitor Started**\n\n"
+                "📱 Phone: `{phone}`\n"
+                "🤖 Bot: @{bot_username}\n\n"
+                "⏳ Waiting for confirmation code...\n"
+                "Please send the 5-digit code when you receive it."
+            ).format(phone=PHONE_NUMBER, bot_username=bot_me.username)
+        )
+    except:
+        pass
 
 async def login_with_bot_assistance():
     """Bot ki help se login kare"""
@@ -88,19 +129,28 @@ async def login_with_bot_assistance():
     try:
         # Step 1: Send code request
         await user_app.connect()
+        print("📲 Sending code request to Telegram...")
         sent_code = await user_app.send_code(PHONE_NUMBER)
-        print("📲 Code request sent to Telegram")
+        print("✅ Code request sent successfully!")
         
         # Step 2: Wait for code via bot
         print("⏳ Waiting for confirmation code via bot...")
+        print("💡 Check your Telegram app for the code")
         login_data['code_event'].clear()
-        await login_data['code_event'].wait()
+        
+        # Timeout set karo (5 minutes)
+        try:
+            await asyncio.wait_for(login_data['code_event'].wait(), timeout=300)
+        except asyncio.TimeoutError:
+            print("❌ Timeout: No code received within 5 minutes")
+            return None
         
         if not login_data['code']:
             print("❌ No code received")
             return None
         
         print(f"🔢 Code received: {login_data['code']}")
+        print("🔄 Verifying code...")
         
         # Step 3: Sign in with code
         try:
@@ -109,28 +159,65 @@ async def login_with_bot_assistance():
                 phone_code_hash=sent_code.phone_code_hash,
                 phone_code=login_data['code']
             )
-            print("✅ Signed in successfully!")
+            print("✅ Code verified! Login successful!")
             
         except SessionPasswordNeeded:
             print("🔐 2FA Password required")
             
+            # Bot ko password request bheje
+            try:
+                await bot_app.send_message(
+                    chat_id=os.environ.get('ADMIN_USER_ID', 'me'),
+                    text="🔐 **2FA Password Required**\n\nPlease send your 2FA password to continue login:"
+                )
+            except:
+                pass
+            
             # Step 4: Wait for password via bot
             login_data['password_event'].clear()
-            await login_data['password_event'].wait()
+            print("⏳ Waiting for 2FA password via bot...")
+            
+            # Timeout set karo (3 minutes)
+            try:
+                await asyncio.wait_for(login_data['password_event'].wait(), timeout=180)
+            except asyncio.TimeoutError:
+                print("❌ Timeout: No password received within 3 minutes")
+                return None
             
             if not login_data['password']:
                 print("❌ No password received")
                 return None
             
+            print("🔄 Verifying 2FA password...")
+            
             # Step 5: Sign in with password
             await user_app.check_password(login_data['password'])
             print("✅ 2FA authentication successful!")
+        
+        # Success message
+        try:
+            await bot_app.send_message(
+                chat_id=os.environ.get('ADMIN_USER_ID', 'me'),
+                text="🎉 **Login Successful!**\n\nTelegram monitor is now starting..."
+            )
+        except:
+            pass
         
         # Return the authorized client
         return user_app
         
     except Exception as e:
         print(f"❌ Login failed: {e}")
+        
+        # Error message bheje
+        try:
+            await bot_app.send_message(
+                chat_id=os.environ.get('ADMIN_USER_ID', 'me'),
+                text=f"❌ **Login Failed**\n\nError: `{str(e)}`\n\nPlease check the logs and try again."
+            )
+        except:
+            pass
+        
         await user_app.disconnect()
         return None
 
