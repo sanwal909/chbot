@@ -1,3 +1,5 @@
+import sys
+print(f"🐍 Python version: {sys.version}")
 import asyncio
 from telethon import TelegramClient, events
 import json
