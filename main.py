@@ -10,7 +10,7 @@ from pyrogram.errors import SessionPasswordNeeded
 
 # Environment variables
 API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH'])
+API_HASH = os.environ['API_HASH']
 BOT_TOKEN = os.environ['BOT_TOKEN']
 PHONE_NUMBER = os.environ['PHONE_NUMBER']
 TARGET_GROUP = os.environ['TARGET_GROUP']
