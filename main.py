@@ -9,7 +9,7 @@ from pyrogram.types import Message
 
 # Environment variables
 API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH'])
+API_HASH = os.environ['API_HASH']
 TARGET_GROUP = os.environ['TARGET_GROUP']
 
 SOURCE_CHANNELS = [
