@@ -13,8 +13,8 @@ from pyrogram.errors import SessionPasswordNeeded
 # Environment variables
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN'])
-TARGET_GROUP = os.environ['TARGET_GROUP'])
+BOT_TOKEN = os.environ['BOT_TOKEN']
+TARGET_GROUP = os.environ['TARGET_GROUP']
 
 SOURCE_CHANNELS = [
     int(os.environ['CHANNEL_1']),
