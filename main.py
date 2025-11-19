@@ -2,12 +2,33 @@ import asyncio
 import os
 import re
 import json
+import sys
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
 import time
 
-# Environment variables - Railway pe set karna
+# Check environment variables first
+def check_environment():
+    required_vars = ['API_ID', 'API_HASH', 'PHONE_NUMBER', 'TARGET_GROUP', 'CHANNEL_1', 'CHANNEL_2']
+    missing_vars = []
+    
+    for var in required_vars:
+        if var not in os.environ:
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print("❌ MISSING ENVIRONMENT VARIABLES:")
+        for var in missing_vars:
+            print(f"   - {var}")
+        print("\n💡 Railway pe yeh variables set karo:")
+        print("   API_ID, API_HASH, PHONE_NUMBER, TARGET_GROUP, CHANNEL_1, CHANNEL_2")
+        sys.exit(1)
+
+# Check environment before anything
+check_environment()
+
+# Now safely get environment variables
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH'] 
 PHONE_NUMBER = os.environ['PHONE_NUMBER']
@@ -18,7 +39,7 @@ SOURCE_CHANNELS = [
     int(os.environ['CHANNEL_2'])
 ]
 
-# Settings
+# Settings with defaults
 WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '15'))
 NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '10'))
 
@@ -203,15 +224,13 @@ async def handle_new_message(client, message):
         await asyncio.sleep(NEXT_POST_DELAY)
 
 async def main():
-    print("🚀 Starting Secure Telegram Monitor...")
-    print("🔒 Using Pyrogram - Python 3.13 Compatible")
-    
-    # Verify required environment variables
-    required_vars = ['API_ID', 'API_HASH', 'PHONE_NUMBER', 'TARGET_GROUP', 'CHANNEL_1', 'CHANNEL_2']
-    for var in required_vars:
-        if var not in os.environ:
-            print(f"❌ Missing required environment variable: {var}")
-            return
+    print("=" * 50)
+    print("🚀 TELEGRAM MONITOR STARTING...")
+    print("=" * 50)
+    print(f"📱 Phone: {PHONE_NUMBER}")
+    print(f"🎯 Target: {TARGET_GROUP}")
+    print(f"📡 Channels: {len(SOURCE_CHANNELS)}")
+    print("=" * 50)
     
     init_storage()
     
@@ -231,6 +250,7 @@ async def main():
         
         print(f"\n✅ Ready | Posted: {posted_count} | Pinned: {pinned_count}")
         print("🔍 Monitoring for new messages...")
+        print("💡 Press Ctrl+C to stop")
         
         # Keep running
         while True:
