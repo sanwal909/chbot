@@ -82,6 +82,8 @@ To create a Telegram session, send your details in this format:
 `123456 abc123def456 +919876543210`
 
 🔒 *Your data is safe and stored only locally*
+
+📤 **OR send me your existing .session file!**
                 """
                 await message.reply(welcome_msg)
                 logger.info(f"Start command from user {message.from_user.id}")
@@ -91,10 +93,15 @@ To create a Telegram session, send your details in this format:
                 help_msg = """
 📖 **How to use this bot:**
 
+**Option 1 - Create New Session:**
 1. Go to https://my.telegram.org
 2. Create an app and get API_ID & API_HASH
 3. Send in format: `API_ID API_HASH PHONE_NUMBER`
 4. Follow the verification steps
+
+**Option 2 - Use Existing Session:**
+1. Send me your .session file
+2. I'll save it for monitoring
 
 ⚠️ **Note:** Use this only for personal testing
                 """
@@ -110,7 +117,91 @@ To create a Telegram session, send your details in this format:
                     await message.reply("✅ **Starting Monitor...**")
                     await self.start_monitoring(user_id, session_file)
                 else:
-                    await message.reply("❌ **No session found!**\nCreate session first with: `API_ID API_HASH PHONE_NUMBER`")
+                    await message.reply("❌ **No session found!**\nCreate session first or send me your session file!")
+            
+            # ✅ NEW: Session file receiver
+            @self.client.on_message(filters.document & filters.private)
+            async def session_file_handler(client, message):
+                """Handle incoming session files"""
+                try:
+                    user_id = message.from_user.id
+                    
+                    if message.document:
+                        file_name = message.document.file_name or ""
+                        
+                        if file_name.endswith('.session'):
+                            # Download the session file
+                            await message.reply("📥 **Downloading session file...**")
+                            
+                            download_path = await message.download()
+                            
+                            # Rename to user-specific session file
+                            new_file_name = f"user_{user_id}.session"
+                            os.rename(download_path, new_file_name)
+                            
+                            # Save to database
+                            self.cursor.execute(
+                                'INSERT OR REPLACE INTO users (user_id, session_file) VALUES (?, ?)',
+                                (user_id, new_file_name)
+                            )
+                            self.conn.commit()
+                            
+                            # Send confirmation
+                            await message.reply(f"""
+✅ **Session File Received!**
+
+📁 File: `{file_name}`
+💾 Saved as: `{new_file_name}`
+🆔 Your ID: `{user_id}`
+
+🔧 **Session file successfully saved!**
+
+📊 **Start monitoring with:** `/monitor`
+                            """)
+                            
+                            logger.info(f"Session file received from user {user_id}: {file_name}")
+                            
+                        else:
+                            await message.reply("❌ **Please send only .session files!**")
+                    
+                except Exception as e:
+                    logger.error(f"Session file handling error: {e}")
+                    await message.reply("❌ Error processing session file!")
+            
+            @self.client.on_message(filters.command("mysessions") & filters.private)
+            async def list_sessions_handler(client, message):
+                """List user's session files"""
+                try:
+                    user_id = message.from_user.id
+                    
+                    # Check database for user sessions
+                    self.cursor.execute('SELECT session_file FROM users WHERE user_id = ?', (user_id,))
+                    result = self.cursor.fetchone()
+                    
+                    # Check filesystem
+                    session_file = f"user_{user_id}.session"
+                    file_exists = os.path.exists(session_file)
+                    
+                    if result or file_exists:
+                        sessions_info = ""
+                        if result:
+                            sessions_info += f"📁 Database: `{result[0]}`\n"
+                        if file_exists:
+                            sessions_info += f"💾 File System: `{session_file}`\n"
+                            
+                        await message.reply(f"""
+📂 **Your Session Files:**
+
+{sessions_info}
+
+📊 **Start monitoring with:** `/monitor`
+                        """)
+                    else:
+                        await message.reply("❌ **No session files found!**\nSend me a .session file or create new session!")
+                        
+                except Exception as e:
+                    logger.error(f"List sessions error: {e}")
+                    await message.reply("❌ Error listing sessions!")
             
             @self.client.on_message(filters.private & filters.text)
             async def message_handler(client, message):
@@ -129,7 +220,7 @@ To create a Telegram session, send your details in this format:
                         if len(parts) == 3:
                             await self.handle_credentials(client, message, parts, user_id)
                         else:
-                            await message.reply("❌ **Invalid format!**\n\nUse: `API_ID API_HASH PHONE_NUMBER`")
+                            await message.reply("❌ **Invalid format!**\n\nUse: `API_ID API_HASH PHONE_NUMBER`\n\nOr send me your .session file!")
                             
                 except Exception as e:
                     logger.error(f"Message handler error: {e}")
@@ -353,7 +444,7 @@ To create a Telegram session, send your details in this format:
             except:
                 pass
 
-    # MONITORING FUNCTIONS
+    # MONITORING FUNCTIONS (SAME AS BEFORE)
     class FileStorage:
         @staticmethod
         def load_json(filename):
