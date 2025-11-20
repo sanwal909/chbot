@@ -35,6 +35,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress Telethon's excessive "Getting difference for channel updates" warnings
+logging.getLogger('telethon.client.updates').setLevel(logging.ERROR)
+logging.getLogger('telethon').setLevel(logging.ERROR)
+
 logger.info(f"Using data directory: {DATA_DIR}")
 
 class SessionBot:
@@ -46,9 +51,16 @@ class SessionBot:
     def setup_database(self):
         """Setup SQLite database for storing user sessions and processed messages"""
         db_path = os.path.join(DATA_DIR, 'bot_database.db')
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        # Enable WAL mode and increase timeout to prevent database locking issues
+        self.conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False, isolation_level=None)
         self.cursor = self.conn.cursor()
-        logger.info(f"Database connected at: {db_path}")
+        
+        # Enable WAL (Write-Ahead Logging) mode for better concurrent access
+        self.cursor.execute('PRAGMA journal_mode=WAL')
+        self.cursor.execute('PRAGMA busy_timeout=30000')
+        
+        logger.info(f"Database connected at: {db_path} with WAL mode enabled")
         
         # Sessions table - supports multiple accounts per user
         self.cursor.execute('''
