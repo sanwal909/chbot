@@ -20,7 +20,7 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # Default monitoring settings (can be customized per user later)
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
-DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '2'))
+DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
 
 # Persistent data directory for Railway deployment
 # Railway's filesystem is ephemeral, so we use /app/data with volume mount
@@ -64,7 +64,7 @@ class SessionBot:
                 source_channels TEXT,
                 checker_bot TEXT,
                 wait_for_reply INTEGER DEFAULT 5,
-                next_post_delay INTEGER DEFAULT 2,
+                next_post_delay INTEGER DEFAULT 5,
                 is_active INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
