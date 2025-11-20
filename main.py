@@ -20,7 +20,7 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # Default monitoring settings (can be customized per user later)
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
-DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
+DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '2'))
 
 # Persistent data directory for Railway deployment
 # Railway's filesystem is ephemeral, so we use /app/data with volume mount
@@ -76,7 +76,7 @@ class SessionBot:
                 source_channels TEXT,
                 checker_bot TEXT,
                 wait_for_reply INTEGER DEFAULT 5,
-                next_post_delay INTEGER DEFAULT 5,
+                next_post_delay INTEGER DEFAULT 2,
                 is_active INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -145,7 +145,7 @@ class SessionBot:
             async def start_handler(client, message):
                 welcome_msg = (
                     "🤖 Welcome to Multi-Account CC Monitor Bot!\n\n"
-                    "✨ Now supports MULTIPLE ACCOUNTS! ✨\n\n"
+                    "✨ Now supports MULTIPLE ACCOUNTS SIMULTANEOUSLY! ✨\n\n"
                     "Step 1: Add Account (Session)\n"
                     "Send your details in this format:\n"
                     "SESSION_NAME API_ID API_HASH PHONE_NUMBER\n\n"
@@ -156,12 +156,14 @@ class SessionBot:
                     "• /sessions - View all your accounts\n"
                     "• /switch SESSION_NAME - Switch active account\n"
                     "• /delete SESSION_NAME - Delete an account\n\n"
-                    "Step 3: Configure Active Account\n"
-                    "/config TARGET_GROUP SOURCE_CH1 SOURCE_CH2 CHECKER_BOT\n\n"
+                    "Step 3: Configure Accounts\n"
+                    "/config TARGET_GROUP SOURCE_CH1 SOURCE_CH2 CHECKER_BOT\n"
+                    "(Configure each account separately using /switch)\n\n"
                     "Step 4: Start Monitoring\n"
-                    "/monitor - Start monitoring with active account\n"
-                    "/stop - Stop monitoring\n\n"
-                    "🔒 All data is stored securely in database"
+                    "• /monitor - Monitor active account\n"
+                    "• /monitorall - Monitor ALL configured accounts\n"
+                    "• /stop - Stop active account\n\n"
+                    "🔒 All data stored securely in database"
                 )
                 await message.reply(welcome_msg)
                 logger.info(f"Start command from user {message.from_user.id}")
@@ -177,17 +179,19 @@ class SessionBot:
                     "5. Use /sessions to view accounts\n"
                     "6. Use /switch SESSION_NAME to activate\n"
                     "7. Configure with /config\n"
-                    "8. Start monitoring with /monitor\n\n"
-                    "Commands:\n"
+                    "8. Start monitoring with /monitor or /monitorall\n\n"
+                    "📱 Commands:\n"
                     "/start - Start bot\n"
                     "/help - Show help\n"
                     "/sessions - View all accounts\n"
                     "/switch - Switch active account\n"
                     "/delete - Delete an account\n"
                     "/config - Configure active account\n"
-                    "/monitor - Start monitoring\n"
-                    "/stop - Stop monitoring\n"
+                    "/monitor - Monitor active account\n"
+                    "/monitorall - Monitor ALL accounts\n"
+                    "/stop - Stop active account\n"
                     "/stats - View stats\n\n"
+                    "💡 Tip: You can monitor multiple accounts simultaneously!\n\n"
                     "⚠️ Note: Use this only for personal testing"
                 )
                 await message.reply(help_msg)
@@ -257,6 +261,11 @@ class SessionBot:
                     await message.reply("❌ Configuration missing!\n\nPlease configure with /config first")
                     return
                 
+                # Check if already monitoring
+                if session_id in self.monitoring_clients:
+                    await message.reply(f"⚠️ '{session_name}' is already being monitored!\n\nUse /stop to stop it first")
+                    return
+                
                 # Check if session file exists (Telethon adds .session extension automatically)
                 session_path_with_ext = f"{self.get_session_path(session_file)}.session"
                 if not os.path.exists(session_path_with_ext):
@@ -264,7 +273,55 @@ class SessionBot:
                     return
                 
                 await message.reply(f"✅ Starting Monitor for '{session_name}'...")
-                await self.start_monitoring(session_id)
+                # Run monitoring in background task (non-blocking for multiple accounts)
+                asyncio.create_task(self.start_monitoring(session_id))
+
+            @self.client.on_message(filters.command("monitorall") & filters.private)
+            async def monitorall_handler(client, message):
+                """Start monitoring for ALL configured sessions"""
+                user_id = message.from_user.id
+                
+                # Get all configured sessions (not just active one)
+                self.cursor.execute('''
+                    SELECT session_id, session_name, target_group, source_channels, session_file
+                    FROM sessions WHERE user_id = ?
+                ''', (user_id,))
+                all_sessions = self.cursor.fetchall()
+                
+                if not all_sessions:
+                    await message.reply("❌ No sessions found!\n\nCreate sessions first")
+                    return
+                
+                started_count = 0
+                already_running = 0
+                not_configured = 0
+                
+                for session_id, session_name, target_group, source_channels, session_file in all_sessions:
+                    # Check if configured
+                    if not target_group or not source_channels:
+                        not_configured += 1
+                        continue
+                    
+                    # Check if already monitoring
+                    if session_id in self.monitoring_clients:
+                        already_running += 1
+                        continue
+                    
+                    # Check if session file exists
+                    session_path_with_ext = f"{self.get_session_path(session_file)}.session"
+                    if not os.path.exists(session_path_with_ext):
+                        continue
+                    
+                    # Start monitoring in background
+                    asyncio.create_task(self.start_monitoring(session_id))
+                    started_count += 1
+                
+                result_msg = f"🚀 Monitor All Results:\n\n"
+                result_msg += f"✅ Started: {started_count}\n"
+                result_msg += f"⚙️ Already running: {already_running}\n"
+                result_msg += f"⚠️ Not configured: {not_configured}"
+                
+                await message.reply(result_msg)
 
             @self.client.on_message(filters.command("stop") & filters.private)
             async def stop_handler(client, message):
@@ -757,8 +814,8 @@ class SessionBot:
                     # APPROVED PATTERNS
                     approved_patterns = [
                         "approved", "Approved", "APPROVED", "✅", "success", "Success",
-                        "Card added", "Response: Card added", "Status:Approved✅",
-                        "Status: Approved ✅","✅ Approved", "APPROVED ✅"
+                        "Card added", "Response: Card added", "Status:Approved✅", 
+                        "✅ Approved", "APPROVED✅"
                     ]
 
                     # DECLINED PATTERNS  
@@ -916,16 +973,22 @@ class SessionBot:
                     f"✅ Monitoring Active for '{session_name}'!\n\n📊 Posted: {stats[1]} | Pinned: {stats[2]}"
                 )
 
-            # Keep monitoring running
-            await asyncio.Event().wait()
+            # Keep monitoring running in background (non-blocking)
+            # This allows multiple sessions to monitor simultaneously
+            logger.info(f"[Session {session_id}] Background monitoring task started for '{session_name}'")
 
         except Exception as e:
             logger.error(f"Monitoring error for session {session_id}: {e}")
-            if 'user_id' in locals():
-                await self.client.send_message(
-                    user_id, 
-                    f"❌ Monitoring failed: {str(e)}"
-                )
+            # Try to get user_id from session_data if available
+            try:
+                if session_data and len(session_data) > 0:
+                    user_id = session_data[0]
+                    await self.client.send_message(
+                        user_id, 
+                        f"❌ Monitoring failed for '{session_name}': {str(e)}"
+                    )
+            except:
+                pass
 
 async def main():
     try:
