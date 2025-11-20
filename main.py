@@ -11,7 +11,6 @@ from typing import List, Union
 from pyrogram.client import Client
 from pyrogram import filters
 from pyrogram.types import Message
-from pyrogram.errors import SessionPasswordNeeded
 from telethon import TelegramClient, events
 
 # Environment variables for BOT ONLY
@@ -321,7 +320,7 @@ Now use `/monitor` to start!
                 del self.user_states[user_id]
 
     async def create_user_session(self, user_id):
-        """Create Telegram session for user using Pyrogram"""
+        """Create Telegram session for user using Telethon"""
         try:
             user_state = self.user_states[user_id]
             api_id = user_state['api_id']
@@ -330,13 +329,12 @@ Now use `/monitor` to start!
 
             session_name = f"user_{user_id}"
 
-            # Create client for user session
-            user_client = Client(session_name, api_id=api_id, api_hash=api_hash)
+            # Create Telethon client for user session
+            user_client = TelegramClient(session_name, api_id, api_hash)
             await user_client.connect()
 
             # Send verification code
-            sent_code = await user_client.send_code(phone)
-            user_state['phone_code_hash'] = sent_code.phone_code_hash
+            await user_client.send_code_request(phone)
             user_state['client'] = user_client
             user_state['step'] = 'waiting_code'
 
@@ -359,26 +357,25 @@ Now use `/monitor` to start!
             user_client = user_state['client']
             phone = user_state['phone']
             code = user_state['code']
-            phone_code_hash = user_state['phone_code_hash']
 
             try:
-                # Sign in with code
-                await user_client.sign_in(
-                    phone_number=phone,
-                    phone_code_hash=phone_code_hash,
-                    phone_code=code
-                )
+                # Sign in with code (Telethon)
+                await user_client.sign_in(phone, code)
 
                 session_name = f"user_{user_id}"
                 await self.save_session(user_id, phone, session_name, user_client)
 
-            except SessionPasswordNeeded:
-                # Ask for 2FA password
-                await self.client.send_message(
-                    user_id,
-                    "🔐 **Two-Factor Authentication Enabled**\n\nPlease enter your 2FA password:"
-                )
-                user_state['step'] = 'waiting_password'
+            except Exception as two_fa_error:
+                # Check if it's 2FA error
+                if "password" in str(two_fa_error).lower() or "2fa" in str(two_fa_error).lower():
+                    # Ask for 2FA password
+                    await self.client.send_message(
+                        user_id,
+                        "🔐 **Two-Factor Authentication Enabled**\n\nPlease enter your 2FA password:"
+                    )
+                    user_state['step'] = 'waiting_password'
+                else:
+                    raise two_fa_error
 
         except Exception as e:
             logger.error(f"Verification processing error: {e}")
@@ -395,11 +392,12 @@ Now use `/monitor` to start!
             user_state = self.user_states[user_id]
             password = user_state['password']
             user_client = user_state['client']
+            phone = user_state['phone']
 
-            await user_client.check_password(password)
+            # Sign in with password (Telethon)
+            await user_client.sign_in(phone, password=password)
 
             session_name = f"user_{user_id}"
-            phone = user_state['phone']
             await self.save_session(user_id, phone, session_name, user_client)
 
         except Exception as e:
