@@ -76,7 +76,7 @@ class SessionBot:
                 source_channels TEXT,
                 checker_bot TEXT,
                 wait_for_reply INTEGER DEFAULT 5,
-                next_post_delay INTEGER DEFAULT 5,
+                next_post_delay INTEGER DEFAULT 2,
                 is_active INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
@@ -757,13 +757,31 @@ class SessionBot:
         except Exception as e:
             logger.error(f"Error updating stats: {e}")
 
-    async def pin_approved_message(self, telethon_client, target_group, message):
-        """Pin approved message"""
+    async def pin_approved_message(self, telethon_client, target_group, reply_message, original_message=None):
+        """Pin approved message (both original CC and bot reply)"""
         try:
-            await telethon_client.pin_message(target_group, message)
-            return True
+            success = True
+            
+            # Pin the bot's reply message (contains approved status)
+            try:
+                await telethon_client.pin_message(target_group, reply_message, notify=False)
+                logger.info(f"Pinned bot reply message")
+            except Exception as e:
+                logger.error(f"Failed to pin reply message: {e}")
+                success = False
+            
+            # Also pin the original CC message if provided
+            if original_message:
+                try:
+                    await telethon_client.pin_message(target_group, original_message, notify=False)
+                    logger.info(f"Pinned original CC message")
+                except Exception as e:
+                    logger.error(f"Failed to pin original message: {e}")
+                    success = False
+            
+            return success
         except Exception as e:
-            logger.error(f"Pin failed: {e}")
+            logger.error(f"Pin operation failed: {e}")
             return False
 
     async def delete_declined_message(self, message):
@@ -827,8 +845,9 @@ class SessionBot:
 
                     # Check for approved
                     if any(pattern.lower() in message_text.lower() for pattern in approved_patterns):
-                        logger.info(f"[Session {session_id}] APPROVED! Pinning...")
-                        success = await self.pin_approved_message(telethon_client, target_group, message)
+                        logger.info(f"[Session {session_id}] APPROVED! Pinning both messages...")
+                        # Pin both the bot reply AND the original CC message
+                        success = await self.pin_approved_message(telethon_client, target_group, message, sent_message)
                         if success:
                             self.update_stats(session_id, posted=0, pinned=1)
                             return "approved"
@@ -951,12 +970,17 @@ class SessionBot:
                     cc_details = self.extract_cc_details(text)
                     if cc_details:
                         logger.info(f"[Session {session_id}] New CC found: {cc_details}")
-                        result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_for_reply)
-                        self.mark_message_processed(session_id, message_signature, cc_details, result)
-                        await asyncio.sleep(next_post_delay)
+                        try:
+                            result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_for_reply)
+                            self.mark_message_processed(session_id, message_signature, cc_details, result)
+                            await asyncio.sleep(next_post_delay)
+                        except Exception as process_error:
+                            logger.error(f"[Session {session_id}] Processing error: {process_error}")
+                            # Don't let processing errors stop the handler
 
                 except Exception as e:
                     logger.error(f"[Session {session_id}] Handler error: {e}")
+                    # Continue monitoring even if handler fails
 
             # Process existing messages
             for channel_id in source_channels:
@@ -974,8 +998,31 @@ class SessionBot:
                 )
 
             # Keep monitoring running in background (non-blocking)
-            # This allows multiple sessions to monitor simultaneously
+            # Telethon client needs to stay connected to listen for events
             logger.info(f"[Session {session_id}] Background monitoring task started for '{session_name}'")
+            
+            # Keep the client running to listen for new messages with auto-reconnect
+            # This runs in background task (created by asyncio.create_task)
+            while session_id in self.monitoring_clients:
+                try:
+                    await telethon_client.run_until_disconnected()
+                    # If we reach here, client disconnected normally
+                    logger.warning(f"[Session {session_id}] Client disconnected for '{session_name}'")
+                    break
+                except Exception as run_error:
+                    logger.error(f"[Session {session_id}] Run error: {run_error}")
+                    # Try to reconnect
+                    try:
+                        if not telethon_client.is_connected():
+                            logger.info(f"[Session {session_id}] Attempting to reconnect...")
+                            await telethon_client.connect()
+                            logger.info(f"[Session {session_id}] Reconnected successfully")
+                            await asyncio.sleep(5)  # Wait before continuing
+                        else:
+                            await asyncio.sleep(10)  # Wait before retrying
+                    except Exception as reconnect_error:
+                        logger.error(f"[Session {session_id}] Reconnect failed: {reconnect_error}")
+                        await asyncio.sleep(30)  # Wait longer before retry
 
         except Exception as e:
             logger.error(f"Monitoring error for session {session_id}: {e}")
@@ -985,10 +1032,18 @@ class SessionBot:
                     user_id = session_data[0]
                     await self.client.send_message(
                         user_id, 
-                        f"❌ Monitoring failed for '{session_name}': {str(e)}"
+                        f"❌ Monitoring failed for '{session_name}': {str(e)}\n\nTrying to auto-reconnect..."
                     )
             except:
                 pass
+        finally:
+            # Cleanup when monitoring stops
+            if session_id in self.monitoring_clients:
+                try:
+                    logger.info(f"[Session {session_id}] Cleaning up monitoring for '{session_name}'")
+                    del self.monitoring_clients[session_id]
+                except:
+                    pass
 
 async def main():
     try:
