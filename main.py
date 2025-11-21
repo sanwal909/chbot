@@ -346,7 +346,8 @@ class SessionBot:
                     "/monitor - Monitor active account\n"
                     "/monitorall - Monitor ALL accounts\n"
                     "/stop - Stop active account\n"
-                    "/stats - View stats\n\n"
+                    "/stats - View stats\n"
+                    "/approved - View approved cards\n\n"
                     "💡 Tip: You can monitor multiple accounts simultaneously!\n\n"
                     "⚠️ Note: Use this only for personal testing"
                 )
@@ -526,6 +527,74 @@ class SessionBot:
                     await message.reply(stats_msg)
                 else:
                     await message.reply("📊 No stats yet!\n\nStart monitoring to collect stats")
+            
+            @self.client.on_message(filters.command("approved") & filters.private)
+            async def approved_handler(client, message):
+                """Show all approved cards for active session with pagination"""
+                user_id = message.from_user.id
+                parts = message.text.split()
+                
+                # Parse page number (default = 1)
+                page = 1
+                if len(parts) >= 2 and parts[1].isdigit():
+                    page = int(parts[1])
+                    page = max(1, page)  # Ensure page is at least 1
+                
+                # Get active session
+                active = await self.safe_db_execute('SELECT session_id, session_name FROM sessions WHERE user_id = ? AND is_active = 1', (user_id,), fetchone=True)
+                
+                if not active:
+                    await message.reply("❌ No active session!\n\nUse /sessions to view and /switch to activate")
+                    return
+                
+                session_id, session_name = active
+                
+                # Get total count
+                count_result = await self.safe_db_execute('''
+                    SELECT COUNT(*) FROM processed_messages 
+                    WHERE session_id = ? AND status = 'approved' AND pinned = 1
+                ''', (session_id,), fetchone=True)
+                
+                total_count = count_result[0] if count_result else 0
+                
+                if total_count == 0:
+                    await message.reply("✅ No approved cards yet!\n\nStart monitoring to collect approved cards")
+                    return
+                
+                # Pagination settings
+                per_page = 50
+                total_pages = (total_count + per_page - 1) // per_page  # Ceiling division
+                page = min(page, total_pages)  # Don't exceed max pages
+                offset = (page - 1) * per_page
+                
+                # Get approved cards for current page
+                approved_cards = await self.safe_db_execute('''
+                    SELECT cc_details, timestamp FROM processed_messages 
+                    WHERE session_id = ? AND status = 'approved' AND pinned = 1
+                    ORDER BY timestamp DESC
+                    LIMIT ? OFFSET ?
+                ''', (session_id, per_page, offset), fetchall=True)
+                
+                msg = f"✅ Approved Cards ({session_name}) - Page {page}/{total_pages}\n\n"
+                for idx, (cc_details, timestamp) in enumerate(approved_cards, offset + 1):
+                    msg += f"{idx}. {cc_details}\n"
+                    if len(msg) > 3500:
+                        await message.reply(msg)
+                        msg = ""
+                
+                if msg:
+                    await message.reply(msg)
+                
+                # Show pagination info
+                footer = f"\n📊 Total: {total_count} approved cards"
+                if total_pages > 1:
+                    footer += f"\n📄 Page {page}/{total_pages}"
+                    if page < total_pages:
+                        footer += f"\n\n➡️ Next page: /approved {page + 1}"
+                    if page > 1:
+                        footer += f"\n⬅️ Previous page: /approved {page - 1}"
+                
+                await message.reply(footer)
 
             @self.client.on_message(filters.command("sessions") & filters.private)
             async def sessions_handler(client, message):
@@ -1016,9 +1085,10 @@ class SessionBot:
 
                     # APPROVED KEYWORDS (will match even if text is bold/formatted)
                     approved_keywords = [
-                        "approved", "success", "card added", "live", "valid" "approved", "Approved", "APPROVED", "✅", "success", "Success",
-                        "Card added", "Response: Card added", "Status: Approved ✅", 
-                        "✅ Approved", "APPROVED✅"
+                        "approved", "success", "card added", "live", "valid",
+                        "status:approved", "status: approved", "approved ✅", 
+                        "✅ approved", "approved✅", "Status: Approved ✅",
+                        "Status:Approved✅", "✅", "Response: Card added"
                     ]
 
                     # DECLINED KEYWORDS
