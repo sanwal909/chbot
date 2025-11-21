@@ -3,3 +3,4 @@ tgcrypto==1.2.5
 pyrogram
 tgcrypto
 telethon
+aiosqlite
