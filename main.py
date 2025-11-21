@@ -13,6 +13,19 @@ from pyrogram import filters
 from pyrogram.types import Message
 from telethon import TelegramClient, events
 
+# Import Replit Object Storage for persistent file storage
+try:
+    from replit.object_storage import Client as StorageClient
+    HAS_OBJECT_STORAGE = True
+    storage_client = StorageClient()
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.info("Replit Object Storage enabled for persistent data")
+except ImportError:
+    HAS_OBJECT_STORAGE = False
+    storage_client = None
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.info("Replit Object Storage not available, using local storage only")
+
 # Environment variables for BOT ONLY - with defaults for testing
 API_ID = int(os.environ.get('API_ID', '0'))
 API_HASH = os.environ.get('API_HASH', '')
@@ -22,14 +35,15 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
 DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
 
-# Persistent data directory for Railway deployment
-# Railway's filesystem is ephemeral, so we use /app/data with volume mount
-# For Replit/local development, use current directory
-if os.path.exists('/app') and os.access('/app', os.W_OK):
-    # Railway environment - use /app/data
-    DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
+# Persistent data directory configuration
+# For Replit deployment, use /home/runner/.data for persistent storage
+# For local/development, use ./data
+REPLIT_ENV = os.environ.get('REPL_ID')
+if REPLIT_ENV:
+    # Replit environment - use home directory for persistence
+    DATA_DIR = os.environ.get('DATA_DIR', os.path.expanduser('~/.data'))
 else:
-    # Replit or local environment - use current directory
+    # Local development
     DATA_DIR = os.environ.get('DATA_DIR', './data')
 
 if not os.path.exists(DATA_DIR):
@@ -54,6 +68,8 @@ class SessionBot:
         self.monitoring_clients = {}
         self.db = None  # Will be initialized in setup_database
         self.db_path = os.path.join(DATA_DIR, 'bot_database.db')
+        self.last_backup_time = 0
+        self.backup_interval = 60
 
     async def setup_database(self):
         """Setup async SQLite database for storing user sessions and processed messages"""
@@ -116,6 +132,92 @@ class SessionBot:
         
         await self.db.commit()
         logger.info("Database setup completed")
+        
+        await self.load_from_storage()
+
+    async def load_from_storage(self):
+        """Load database and session files from object storage on startup"""
+        if not HAS_OBJECT_STORAGE or not storage_client:
+            logger.info("Object storage not available, skipping restore")
+            return
+        
+        try:
+            if storage_client.exists("bot_database.db"):
+                logger.info("Restoring database from object storage...")
+                storage_client.download_to_filename("bot_database.db", self.db_path)
+                logger.info("Database restored from object storage")
+                
+                if self.db:
+                    await self.db.close()
+                self.db = await aiosqlite.connect(self.db_path, timeout=30.0)
+                await self.db.execute('PRAGMA journal_mode=WAL')
+                await self.db.execute('PRAGMA synchronous=NORMAL')
+            
+            for obj in storage_client.list(prefix="sessions/"):
+                if obj.name.endswith('.session'):
+                    session_file_name = obj.name.replace('sessions/', '')
+                    local_path = os.path.join(DATA_DIR, session_file_name)
+                    logger.info(f"Restoring session file: {session_file_name}")
+                    storage_client.download_to_filename(obj.name, local_path)
+                    
+        except Exception as e:
+            logger.warning(f"Could not restore from storage (this is normal on first run): {e}")
+    
+    async def save_to_storage(self, force=False):
+        """Save database and session files to object storage with throttling"""
+        if not HAS_OBJECT_STORAGE or not storage_client:
+            return
+        
+        current_time = time.time()
+        if not force and (current_time - self.last_backup_time) < self.backup_interval:
+            return
+        
+        try:
+            if self.db:
+                await self.db.commit()
+            
+            if os.path.exists(self.db_path):
+                logger.info("Backing up database to object storage...")
+                storage_client.upload_from_filename("bot_database.db", self.db_path)
+            
+            local_sessions = set()
+            for filename in os.listdir(DATA_DIR):
+                if filename.endswith('.session'):
+                    local_sessions.add(filename)
+                    local_path = os.path.join(DATA_DIR, filename)
+                    storage_key = f"sessions/{filename}"
+                    storage_client.upload_from_filename(storage_key, local_path)
+                    logger.info(f"Backed up session file: {filename}")
+            
+            remote_sessions = set()
+            for obj in storage_client.list(prefix="sessions/"):
+                if obj.name.endswith('.session'):
+                    session_file = obj.name.replace('sessions/', '')
+                    remote_sessions.add(session_file)
+            
+            deleted_sessions = remote_sessions - local_sessions
+            for session_file in deleted_sessions:
+                storage_key = f"sessions/{session_file}"
+                logger.info(f"Deleting removed session from storage: {session_file}")
+                storage_client.delete(storage_key, ignore_not_found=True)
+            
+            self.last_backup_time = current_time
+                    
+        except Exception as e:
+            logger.error(f"Error saving to storage: {e}")
+    
+    async def delete_session_from_storage(self, session_file):
+        """Delete a specific session file from object storage"""
+        if not HAS_OBJECT_STORAGE or not storage_client:
+            return
+        
+        try:
+            storage_key = f"sessions/{session_file}.session"
+            if storage_client.exists(storage_key):
+                storage_client.delete(storage_key)
+                logger.info(f"Deleted session from storage: {session_file}")
+        except Exception as e:
+            logger.error(f"Error deleting from storage: {e}")
 
     async def safe_db_execute(self, query, params=(), commit=False, fetchone=False, fetchall=False):
         """Execute database query using aiosqlite - properly async without blocking"""
@@ -127,6 +229,7 @@ class SessionBot:
             
             if commit:
                 await self.db.commit()
+                asyncio.create_task(self.save_to_storage())
             
             if fetchone:
                 result = await cursor.fetchone()
@@ -146,7 +249,8 @@ class SessionBot:
             logger.error(f"Database error: {e}")
             # Rollback on error
             try:
-                await self.db.rollback()
+                if self.db:
+                    await self.db.rollback()
             except:
                 pass
             raise
@@ -504,6 +608,9 @@ class SessionBot:
                 except:
                     pass
                 
+                await self.delete_session_from_storage(session_file)
+                await self.save_to_storage(force=True)
+                
                 await message.reply(f"✅ Session '{session_name}' deleted successfully!")
 
             @self.client.on_message(filters.private & filters.text)
@@ -723,6 +830,8 @@ class SessionBot:
                 UPDATE sessions SET is_active = 0 
                 WHERE user_id = ? AND session_id != ?
             ''', (user_id, session_id), commit=True)
+            
+            await self.save_to_storage(force=True)
 
             # Send success message
             success_msg = (
