@@ -3,10 +3,9 @@ import os
 import re
 import json
 import sys
-import sqlite3
+import aiosqlite
 import logging
 import time
-import threading
 from datetime import datetime
 from typing import List, Union
 from pyrogram.client import Client
@@ -14,10 +13,10 @@ from pyrogram import filters
 from pyrogram.types import Message
 from telethon import TelegramClient, events
 
-# Environment variables for BOT ONLY
-API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN']
+# Environment variables for BOT ONLY - with defaults for testing
+API_ID = int(os.environ.get('API_ID', '0'))
+API_HASH = os.environ.get('API_HASH', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
 # Default monitoring settings (can be customized per user later)
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
@@ -47,29 +46,26 @@ class SessionBot:
     def __init__(self):
         self.user_states = {}
         self.monitoring_clients = {}
-        self.db_lock = threading.RLock()  # Reentrant lock for database operations
-        self.setup_database()
+        self.db = None  # Will be initialized in setup_database
+        self.db_path = os.path.join(DATA_DIR, 'bot_database.db')
 
-    def setup_database(self):
-        """Setup SQLite database for storing user sessions and processed messages"""
-        db_path = os.path.join(DATA_DIR, 'bot_database.db')
+    async def setup_database(self):
+        """Setup async SQLite database for storing user sessions and processed messages"""
+        logger.info(f"Setting up async database at: {self.db_path}")
         
-        # Use autocommit mode with WAL for best concurrency
-        # isolation_level=None enables autocommit - prevents hanging transactions
-        self.conn = sqlite3.connect(db_path, timeout=60.0, check_same_thread=False, isolation_level=None)
-        self.cursor = self.conn.cursor()
+        # Connect to database with aiosqlite
+        self.db = await aiosqlite.connect(self.db_path, timeout=30.0)
         
         # Enable WAL (Write-Ahead Logging) mode for better concurrent access
-        self.cursor.execute('PRAGMA journal_mode=WAL')
-        self.cursor.execute('PRAGMA busy_timeout=60000')  # 60 seconds
-        self.cursor.execute('PRAGMA synchronous=NORMAL')  # Faster writes, still safe with WAL
-        self.cursor.execute('PRAGMA cache_size=-64000')  # 64MB cache
-        self.cursor.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp tables
+        await self.db.execute('PRAGMA journal_mode=WAL')
+        await self.db.execute('PRAGMA synchronous=NORMAL')  # Faster writes, still safe with WAL
+        await self.db.execute('PRAGMA cache_size=-64000')  # 64MB cache
+        await self.db.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp tables
         
-        logger.info(f"Database connected at: {db_path} with WAL mode and optimizations enabled")
+        logger.info(f"Database connected with WAL mode enabled")
         
         # Sessions table - supports multiple accounts per user
-        self.cursor.execute('''
+        await self.db.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -89,7 +85,7 @@ class SessionBot:
         ''')
         
         # Processed messages table - replaces JSON files
-        self.cursor.execute('''
+        await self.db.execute('''
             CREATE TABLE IF NOT EXISTS processed_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER,
@@ -103,7 +99,7 @@ class SessionBot:
         ''')
         
         # Stats table - per session stats
-        self.cursor.execute('''
+        await self.db.execute('''
             CREATE TABLE IF NOT EXISTS session_stats (
                 session_id INTEGER PRIMARY KEY,
                 posted_count INTEGER DEFAULT 0,
@@ -112,57 +108,42 @@ class SessionBot:
             )
         ''')
         
-        self.conn.commit()
+        await self.db.commit()
         logger.info("Database setup completed")
 
-    async def safe_db_execute(self, query, params=(), commit=False, fetchone=False, fetchall=False, max_retries=3):
-        """Execute database query with async retry logic to prevent locks"""
-        for attempt in range(max_retries):
+    async def safe_db_execute(self, query, params=(), commit=False, fetchone=False, fetchall=False):
+        """Execute database query using aiosqlite - properly async without blocking"""
+        try:
+            if not self.db:
+                raise Exception("Database not initialized")
+            
+            cursor = await self.db.execute(query, params)
+            
+            if commit:
+                await self.db.commit()
+            
+            if fetchone:
+                result = await cursor.fetchone()
+                await cursor.close()
+                return result
+            elif fetchall:
+                result = await cursor.fetchall()
+                await cursor.close()
+                return result
+            else:
+                # Return lastrowid for INSERT operations
+                lastrowid = cursor.lastrowid
+                await cursor.close()
+                return lastrowid
+                    
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            # Rollback on error
             try:
-                with self.db_lock:
-                    cursor = self.conn.cursor()
-                    cursor.execute(query, params)
-                    
-                    # With isolation_level=None (autocommit), explicit commits are no-ops
-                    # but we keep the parameter for clarity and future flexibility
-                    if commit:
-                        try:
-                            self.conn.commit()
-                        except:
-                            pass  # In autocommit mode, commit() does nothing
-                    
-                    if fetchone:
-                        return cursor.fetchone()
-                    elif fetchall:
-                        return cursor.fetchall()
-                    elif not commit:
-                        # Return lastrowid for INSERT operations
-                        return cursor.lastrowid
-                    return True
-                    
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e).lower() and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 0.5  # Exponential backoff: 0.5s, 1s, 1.5s
-                    logger.warning(f"Database locked, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(wait_time)  # Use asyncio.sleep to not block event loop
-                else:
-                    # Ensure database is not left in bad state
-                    try:
-                        self.conn.rollback()
-                    except:
-                        pass
-                    logger.error(f"Database error after {attempt + 1} attempts: {e}")
-                    raise
-            except Exception as e:
-                # Rollback on any error to prevent hanging transactions
-                try:
-                    self.conn.rollback()
-                except:
-                    pass
-                logger.error(f"Database error: {e}")
-                raise
-        
-        return None
+                await self.db.rollback()
+            except:
+                pass
+            raise
 
     async def get_active_session(self, user_id):
         """Get active session for a user"""
@@ -788,31 +769,42 @@ class SessionBot:
 
     async def is_message_processed(self, session_id, message_signature):
         """Check if message was already processed - uses database"""
-        result = await self.safe_db_execute('''
-            SELECT id FROM processed_messages 
-            WHERE session_id = ? AND message_signature = ?
-        ''', (session_id, message_signature), fetchone=True)
-        return result is not None
+        try:
+            result = await self.safe_db_execute('''
+                SELECT id FROM processed_messages 
+                WHERE session_id = ? AND message_signature = ?
+            ''', (session_id, message_signature), fetchone=True)
+            return result is not None
+        except Exception as e:
+            logger.error(f"Error checking message processed status: {e}")
+            # Return False to allow processing if database check fails
+            return False
 
     async def mark_message_processed(self, session_id, message_signature, cc_details, status):
         """Mark message as processed - uses database with retry logic"""
         try:
-            await self.safe_db_execute('''
+            result = await self.safe_db_execute('''
                 INSERT OR REPLACE INTO processed_messages 
                 (session_id, message_signature, cc_details, status, pinned, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (session_id, message_signature, cc_details, status, 1 if status == 'approved' else 0, datetime.now().isoformat()), commit=True)
+            
+            if result is None:
+                logger.warning(f"Database locked when marking message, will retry on next run")
         except Exception as e:
             logger.error(f"Error marking message: {e}")
 
     async def update_stats(self, session_id, posted=0, pinned=0):
         """Update session stats with retry logic"""
         try:
-            await self.safe_db_execute('''
+            result = await self.safe_db_execute('''
                 UPDATE session_stats 
                 SET posted_count = posted_count + ?, pinned_count = pinned_count + ?
                 WHERE session_id = ?
             ''', (posted, pinned, session_id), commit=True)
+            
+            if result is None:
+                logger.warning(f"Database locked when updating stats, skipping this update")
         except Exception as e:
             logger.error(f"Error updating stats: {e}")
 
@@ -1062,7 +1054,7 @@ class SessionBot:
                 # Create background task for keepalive pings (prevents timeout)
                 async def keepalive():
                     """Send periodic pings to keep connection alive"""
-                    while telethon_client.is_connected():
+                    while session_id in self.monitoring_clients:
                         try:
                             await asyncio.sleep(300)  # Ping every 5 minutes
                             if telethon_client.is_connected():
@@ -1078,6 +1070,8 @@ class SessionBot:
                 try:
                     # Keep client running - will return when disconnected
                     await telethon_client.run_until_disconnected()
+                except Exception as disconnect_error:
+                    logger.warning(f"[Session {session_id}] Client disconnected with error: {disconnect_error}")
                 finally:
                     # Cancel keepalive when client disconnects
                     keepalive_task.cancel()
@@ -1085,6 +1079,13 @@ class SessionBot:
                         await keepalive_task
                     except asyncio.CancelledError:
                         pass
+                    
+                    # Properly disconnect client
+                    try:
+                        if telethon_client.is_connected():
+                            await telethon_client.disconnect()
+                    except Exception as e:
+                        logger.debug(f"[Session {session_id}] Error during disconnect cleanup: {e}")
                 
                 # If we reach here, client disconnected (normal after ~2 hours)
                 logger.warning(f"[Session {session_id}] Client disconnected, will auto-reconnect in {reconnect_delay}s...")
@@ -1096,16 +1097,17 @@ class SessionBot:
                 # Cleanup current client if it exists
                 if session_id in self.monitoring_clients and self.monitoring_clients[session_id]:
                     try:
-                        await self.monitoring_clients[session_id].disconnect()
-                    except:
-                        pass
+                        if self.monitoring_clients[session_id].is_connected():
+                            await self.monitoring_clients[session_id].disconnect()
+                    except Exception as disconnect_error:
+                        logger.debug(f"[Session {session_id}] Error during error-cleanup disconnect: {disconnect_error}")
                 
                 # Exponential backoff for reconnect (max 60s)
                 reconnect_delay = min(reconnect_delay * 2, 60)
                 logger.info(f"[Session {session_id}] Will retry in {reconnect_delay}s...")
                 
-                # Notify user on repeated failures
-                if reconnect_delay >= 30:
+                # Notify user on repeated failures (skip database lock errors)
+                if reconnect_delay >= 30 and "database is locked" not in str(e).lower():
                     try:
                         await self.client.send_message(
                             user_id, 
@@ -1113,8 +1115,8 @@ class SessionBot:
                             f"Auto-reconnecting in {reconnect_delay}s...\n"
                             f"(This is normal - monitoring will resume automatically)"
                         )
-                    except:
-                        pass
+                    except Exception as msg_error:
+                        logger.debug(f"[Session {session_id}] Could not notify user: {msg_error}")
                 
                 await asyncio.sleep(reconnect_delay)
         
