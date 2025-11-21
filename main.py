@@ -20,7 +20,7 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # Default monitoring settings (can be customized per user later)
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
-DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
+DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '2'))
 
 # Persistent data directory for Railway deployment
 # Railway's filesystem is ephemeral, so we use /app/data with volume mount
@@ -717,6 +717,27 @@ class SessionBot:
 
     # MONITORING FUNCTIONS (Using Telethon from main2.py)
     
+    def strip_markdown_formatting(self, text):
+        """Strip Telegram markdown/HTML formatting from text for pattern matching"""
+        if not text:
+            return ""
+        
+        # Remove bold markdown: **text** or __text__
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'__(.*?)__', r'\1', text)
+        
+        # Remove italic markdown: *text* or _text_
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        text = re.sub(r'_(.*?)_', r'\1', text)
+        
+        # Remove HTML tags: <b>text</b>, <i>text</i>, etc.
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Normalize whitespace
+        text = ' '.join(text.split())
+        
+        return text
+    
     def extract_cc_details(self, text):
         """Extract credit card details from text"""
         if not text:
@@ -828,24 +849,27 @@ class SessionBot:
                 if message.reply_to and message.reply_to.reply_to_msg_id == sent_message.id:
                     message_text = message.text or ""
                     logger.info(f"[Session {session_id}] Bot replied: {message_text[:100]}")
+                    
+                    # Strip markdown/HTML formatting for reliable pattern matching
+                    clean_text = self.strip_markdown_formatting(message_text)
+                    clean_lower = clean_text.lower()
+                    logger.info(f"[Session {session_id}] Clean text: {clean_text[:100]}")
 
-                    # APPROVED PATTERNS
-                    approved_patterns = [
-                        "approved", "Approved", "APPROVED", "✅", "success", "Success",
-                        "Card added", "Response: Card added", "Status:Approved✅", 
-                        "✅ Approved", "APPROVED✅"
+                    # APPROVED KEYWORDS (will match even if text is bold/formatted)
+                    approved_keywords = [
+                        "approved", "success", "card added", "live", "valid" "approved", "Approved", "APPROVED", "✅", "success", "Success",
+                        "Card added", "Response: Card added", "Status: Approved ✅", 
+                        "✅ Approved", "APPROVED✅
                     ]
 
-                    # DECLINED PATTERNS  
-                    declined_patterns = [
-                        "declined", "Declined", "DECLINED", "❌", "failed", "Failed",
-                        "dead", "Dead", "DEAD", "invalid", "Invalid", "error", "Error",
-                        "Declined ❌"
+                    # DECLINED KEYWORDS
+                    declined_keywords = [
+                        "declined", "failed", "dead", "invalid", "error", "insufficient"
                     ]
 
-                    # Check for approved
-                    if any(pattern.lower() in message_text.lower() for pattern in approved_patterns):
-                        logger.info(f"[Session {session_id}] APPROVED! Pinning both messages...")
+                    # Check for approved (case-insensitive, works with bold text)
+                    if any(keyword in clean_lower for keyword in approved_keywords):
+                        logger.info(f"[Session {session_id}] ✅ APPROVED! Pinning both messages...")
                         # Pin both the bot reply AND the original CC message
                         success = await self.pin_approved_message(telethon_client, target_group, message, sent_message)
                         if success:
@@ -854,8 +878,8 @@ class SessionBot:
                         return "approved_but_pin_failed"
 
                     # Check for declined
-                    elif any(pattern.lower() in message_text.lower() for pattern in declined_patterns):
-                        logger.info(f"[Session {session_id}] DECLINED! Deleting...")
+                    elif any(keyword in clean_lower for keyword in declined_keywords):
+                        logger.info(f"[Session {session_id}] ❌ DECLINED! Deleting...")
                         await self.delete_declined_message(message)
                         return "declined"
 
@@ -895,155 +919,127 @@ class SessionBot:
             return False
 
     async def start_monitoring(self, session_id):
-        """Start monitoring channels using Telethon for a specific session"""
-        try:
-            logger.info(f"Starting monitoring for session {session_id}")
-            
-            # Get session data from database
-            self.cursor.execute('''
-                SELECT user_id, session_name, api_id, api_hash, phone, session_file, 
-                       target_group, source_channels, checker_bot, wait_for_reply, next_post_delay
-                FROM sessions WHERE session_id = ?
-            ''', (session_id,))
-            session_data = self.cursor.fetchone()
-            
-            if not session_data:
-                logger.error(f"Session {session_id} not found!")
-                return
-            
-            user_id, session_name, api_id, api_hash, phone, session_file, target_group, source_channels_str, checker_bot, wait_for_reply, next_post_delay = session_data
-            
-            if not source_channels_str:
-                await self.client.send_message(user_id, f"❌ Configure '{session_name}' first with /config")
-                return
-            
-            source_channels = [int(ch.strip()) if ch.strip().lstrip('-').isdigit() else ch.strip() for ch in source_channels_str.split(',')]
-
-            # Get session file path (Telethon automatically adds .session extension)
-            session_path = self.get_session_path(session_file)
-
-            # Create Telethon client with persistent path
-            telethon_client = TelegramClient(session_path, api_id, api_hash)
-            await telethon_client.start()
-
-            me = await telethon_client.get_me()
-            logger.info(f"Monitoring started for session '{session_name}': {me.first_name}")
-
-            # Store client with session_id as key
-            self.monitoring_clients[session_id] = telethon_client
-
-            # Notify user
-            monitoring_msg = (
-                f"🔍 Monitoring Started for '{session_name}'!\n\n"
-                f"👤 User: {me.first_name}\n"
-                f"📱 Phone: {phone}\n"
-                f"🎯 Target: {target_group}\n"
-                f"📡 Channels: {len(source_channels)}\n"
-                f"🤖 Checker: {checker_bot}\n\n"
-                f"Monitoring channels for CC details..."
-            )
-            await self.client.send_message(user_id, monitoring_msg)
-
-            # Initial cleanup
-            logger.info(f"[Session {session_id}] Initial cleanup...")
-            await self.cleanup_group_messages(telethon_client, target_group)
-
-            # Message handler for new messages
-            @telethon_client.on(events.NewMessage)
-            async def handler(event):
-                try:
-                    message = event.message
-                    chat_id = message.chat.id if hasattr(message.chat, 'id') else message.chat_id
-
-                    # Only process source channels
-                    if chat_id not in source_channels:
-                        return
-
-                    text = message.text
-                    if not text:
-                        return
-
-                    message_signature = f"{chat_id}_{message.id}"
-                    if self.is_message_processed(session_id, message_signature):
-                        return
-
-                    cc_details = self.extract_cc_details(text)
-                    if cc_details:
-                        logger.info(f"[Session {session_id}] New CC found: {cc_details}")
-                        try:
-                            result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_for_reply)
-                            self.mark_message_processed(session_id, message_signature, cc_details, result)
-                            await asyncio.sleep(next_post_delay)
-                        except Exception as process_error:
-                            logger.error(f"[Session {session_id}] Processing error: {process_error}")
-                            # Don't let processing errors stop the handler
-
-                except Exception as e:
-                    logger.error(f"[Session {session_id}] Handler error: {e}")
-                    # Continue monitoring even if handler fails
-
-            # Process existing messages
-            for channel_id in source_channels:
-                await self.process_source_channel(session_id, telethon_client, target_group, channel_id, wait_for_reply, next_post_delay)
-
-            logger.info(f"[Session {session_id}] Monitoring active for '{session_name}'")
-            
-            # Get current stats
-            self.cursor.execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,))
-            stats = self.cursor.fetchone()
-            if stats:
-                await self.client.send_message(
-                    user_id,
-                    f"✅ Monitoring Active for '{session_name}'!\n\n📊 Posted: {stats[1]} | Pinned: {stats[2]}"
-                )
-
-            # Keep monitoring running in background (non-blocking)
-            # Telethon client needs to stay connected to listen for events
-            logger.info(f"[Session {session_id}] Background monitoring task started for '{session_name}'")
-            
-            # Keep the client running to listen for new messages with auto-reconnect
-            # This runs in background task (created by asyncio.create_task)
-            while session_id in self.monitoring_clients:
-                try:
-                    await telethon_client.run_until_disconnected()
-                    # If we reach here, client disconnected normally
-                    logger.warning(f"[Session {session_id}] Client disconnected for '{session_name}'")
-                    break
-                except Exception as run_error:
-                    logger.error(f"[Session {session_id}] Run error: {run_error}")
-                    # Try to reconnect
-                    try:
-                        if not telethon_client.is_connected():
-                            logger.info(f"[Session {session_id}] Attempting to reconnect...")
-                            await telethon_client.connect()
-                            logger.info(f"[Session {session_id}] Reconnected successfully")
-                            await asyncio.sleep(5)  # Wait before continuing
-                        else:
-                            await asyncio.sleep(10)  # Wait before retrying
-                    except Exception as reconnect_error:
-                        logger.error(f"[Session {session_id}] Reconnect failed: {reconnect_error}")
-                        await asyncio.sleep(30)  # Wait longer before retry
-
-        except Exception as e:
-            logger.error(f"Monitoring error for session {session_id}: {e}")
-            # Try to get user_id from session_data if available
+        """Start monitoring channels using Telethon - PERSISTENT with auto-reconnect"""
+        # Get session data from database ONCE
+        self.cursor.execute('''
+            SELECT user_id, session_name, api_id, api_hash, phone, session_file, 
+                   target_group, source_channels, checker_bot, wait_for_reply, next_post_delay
+            FROM sessions WHERE session_id = ?
+        ''', (session_id,))
+        session_data = self.cursor.fetchone()
+        
+        if not session_data:
+            logger.error(f"Session {session_id} not found!")
+            return
+        
+        user_id, session_name, api_id, api_hash, phone, session_file, target_group, source_channels_str, checker_bot, wait_for_reply, next_post_delay = session_data
+        
+        if not source_channels_str:
+            await self.client.send_message(user_id, f"❌ Configure '{session_name}' first with /config")
+            return
+        
+        source_channels = [int(ch.strip()) if ch.strip().lstrip('-').isdigit() else ch.strip() for ch in source_channels_str.split(',')]
+        session_path = self.get_session_path(session_file)
+        
+        # Mark as active BEFORE starting the loop
+        self.monitoring_clients[session_id] = None  # Placeholder
+        
+        reconnect_delay = 5  # Start with 5 seconds
+        first_run = True
+        
+        # PERSISTENT LOOP - only breaks when /stop removes from monitoring_clients
+        while session_id in self.monitoring_clients:
             try:
-                if session_data and len(session_data) > 0:
-                    user_id = session_data[0]
-                    await self.client.send_message(
-                        user_id, 
-                        f"❌ Monitoring failed for '{session_name}': {str(e)}\n\nTrying to auto-reconnect..."
+                logger.info(f"[Session {session_id}] {'Starting' if first_run else 'Reconnecting'} monitoring for '{session_name}'...")
+                
+                # Create NEW Telethon client
+                telethon_client = TelegramClient(session_path, api_id, api_hash)
+                await telethon_client.start()
+                
+                # Update client reference
+                self.monitoring_clients[session_id] = telethon_client
+                
+                me = await telethon_client.get_me()
+                logger.info(f"[Session {session_id}] Connected as: {me.first_name}")
+                
+                # Notify user on first connection
+                if first_run:
+                    monitoring_msg = (
+                        f"🔍 Monitoring Started for '{session_name}'!\n\n"
+                        f"👤 User: {me.first_name}\n"
+                        f"📱 Phone: {phone}\n"
+                        f"🎯 Target: {target_group}\n"
+                        f"📡 Channels: {len(source_channels)}\n"
+                        f"🤖 Checker: {checker_bot}\n\n"
+                        f"✅ Auto-reconnect enabled - monitoring will run continuously!"
                     )
-            except:
-                pass
-        finally:
-            # Cleanup when monitoring stops
-            if session_id in self.monitoring_clients:
-                try:
-                    logger.info(f"[Session {session_id}] Cleaning up monitoring for '{session_name}'")
-                    del self.monitoring_clients[session_id]
-                except:
-                    pass
+                    await self.client.send_message(user_id, monitoring_msg)
+                    first_run = False
+                
+                # Register event handler for new messages
+                @telethon_client.on(events.NewMessage)
+                async def handler(event):
+                    try:
+                        message = event.message
+                        chat_id = message.chat.id if hasattr(message.chat, 'id') else message.chat_id
+
+                        if chat_id not in source_channels:
+                            return
+
+                        text = message.text
+                        if not text:
+                            return
+
+                        message_signature = f"{chat_id}_{message.id}"
+                        if self.is_message_processed(session_id, message_signature):
+                            return
+
+                        cc_details = self.extract_cc_details(text)
+                        if cc_details:
+                            logger.info(f"[Session {session_id}] New CC found: {cc_details}")
+                            try:
+                                result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_for_reply)
+                                self.mark_message_processed(session_id, message_signature, cc_details, result)
+                                await asyncio.sleep(next_post_delay)
+                            except Exception as process_error:
+                                logger.error(f"[Session {session_id}] Processing error: {process_error}")
+
+                    except Exception as e:
+                        logger.error(f"[Session {session_id}] Handler error: {e}")
+                
+                # Process existing messages ONLY on first run
+                if reconnect_delay == 5:  # First run indicator
+                    for channel_id in source_channels:
+                        await self.process_source_channel(session_id, telethon_client, target_group, channel_id, wait_for_reply, next_post_delay)
+                
+                # Get current stats
+                self.cursor.execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,))
+                stats = self.cursor.fetchone()
+                if stats:
+                    logger.info(f"[Session {session_id}] Stats - Posted: {stats[1]}, Pinned: {stats[2]}")
+                
+                logger.info(f"[Session {session_id}] Monitoring active, listening for new messages...")
+                
+                # Reset reconnect delay on successful connection
+                reconnect_delay = 5
+                
+                # Keep client running - will return when disconnected
+                await telethon_client.run_until_disconnected()
+                
+                # If we reach here, client disconnected (normal after ~2 hours)
+                logger.warning(f"[Session {session_id}] Client disconnected, will auto-reconnect in {reconnect_delay}s...")
+                await asyncio.sleep(reconnect_delay)
+                
+            except Exception as e:
+                logger.error(f"[Session {session_id}] Monitoring error: {e}")
+                
+                # Exponential backoff for reconnect (max 60s)
+                reconnect_delay = min(reconnect_delay * 2, 60)
+                logger.info(f"[Session {session_id}] Will retry in {reconnect_delay}s...")
+                await asyncio.sleep(reconnect_delay)
+        
+        # Only cleanup when /stop is called
+        logger.info(f"[Session {session_id}] Monitoring stopped for '{session_name}'")
 
 async def main():
     try:
