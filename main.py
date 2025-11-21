@@ -24,8 +24,14 @@ DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
 
 # Persistent data directory for Railway deployment
 # Railway's filesystem is ephemeral, so we use /app/data with volume mount
-# For local development, use current directory
-DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
+# For Replit/local development, use current directory
+if os.path.exists('/app') and os.access('/app', os.W_OK):
+    # Railway environment - use /app/data
+    DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
+else:
+    # Replit or local environment - use current directory
+    DATA_DIR = os.environ.get('DATA_DIR', './data')
+
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
     
@@ -170,8 +176,20 @@ class SessionBot:
     async def start_bot(self):
         """Start the Telegram bot"""
         try:
+            # Initialize database first
+            await self.setup_database()
+            
             logger.info("Creating Telegram bot client...")
             bot_session_path = os.path.join(DATA_DIR, 'session_bot')
+            
+            # Check if credentials are provided
+            if not API_ID or not API_HASH or not BOT_TOKEN:
+                logger.error("Missing bot credentials! Please provide API_ID, API_HASH, and BOT_TOKEN environment variables.")
+                logger.info("Bot will keep running and wait for credentials...")
+                # Keep event loop alive for testing
+                await asyncio.Event().wait()
+                return
+            
             self.client = Client(bot_session_path, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
             # Event handlers
@@ -781,32 +799,34 @@ class SessionBot:
             return False
 
     async def mark_message_processed(self, session_id, message_signature, cc_details, status):
-        """Mark message as processed - uses database with retry logic"""
-        try:
-            result = await self.safe_db_execute('''
-                INSERT OR REPLACE INTO processed_messages 
-                (session_id, message_signature, cc_details, status, pinned, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (session_id, message_signature, cc_details, status, 1 if status == 'approved' else 0, datetime.now().isoformat()), commit=True)
-            
-            if result is None:
-                logger.warning(f"Database locked when marking message, will retry on next run")
-        except Exception as e:
-            logger.error(f"Error marking message: {e}")
+        """Mark message as processed - offloaded to background task"""
+        async def _mark_in_background():
+            try:
+                await self.safe_db_execute('''
+                    INSERT OR REPLACE INTO processed_messages 
+                    (session_id, message_signature, cc_details, status, pinned, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (session_id, message_signature, cc_details, status, 1 if status == 'approved' else 0, datetime.now().isoformat()), commit=True)
+            except Exception as e:
+                logger.error(f"Error marking message: {e}")
+        
+        # Run in background to not block Telethon
+        asyncio.create_task(_mark_in_background())
 
     async def update_stats(self, session_id, posted=0, pinned=0):
-        """Update session stats with retry logic"""
-        try:
-            result = await self.safe_db_execute('''
-                UPDATE session_stats 
-                SET posted_count = posted_count + ?, pinned_count = pinned_count + ?
-                WHERE session_id = ?
-            ''', (posted, pinned, session_id), commit=True)
-            
-            if result is None:
-                logger.warning(f"Database locked when updating stats, skipping this update")
-        except Exception as e:
-            logger.error(f"Error updating stats: {e}")
+        """Update session stats - offloaded to background task"""
+        async def _update_in_background():
+            try:
+                await self.safe_db_execute('''
+                    UPDATE session_stats 
+                    SET posted_count = posted_count + ?, pinned_count = pinned_count + ?
+                    WHERE session_id = ?
+                ''', (posted, pinned, session_id), commit=True)
+            except Exception as e:
+                logger.error(f"Error updating stats: {e}")
+        
+        # Run in background to not block Telethon
+        asyncio.create_task(_update_in_background())
 
     async def pin_approved_message(self, telethon_client, target_group, reply_message, original_message=None):
         """Pin approved message (both original CC and bot reply)"""
