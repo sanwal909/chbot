@@ -20,7 +20,7 @@ BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # Default monitoring settings (can be customized per user later)
 DEFAULT_WAIT_FOR_REPLY = int(os.environ.get('WAIT_FOR_REPLY', '5'))
-DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '2'))
+DEFAULT_NEXT_POST_DELAY = int(os.environ.get('NEXT_POST_DELAY', '5'))
 
 # Persistent data directory for Railway deployment
 # Railway's filesystem is ephemeral, so we use /app/data with volume mount
@@ -859,7 +859,7 @@ class SessionBot:
                     approved_keywords = [
                         "approved", "success", "card added", "live", "valid" "approved", "Approved", "APPROVED", "✅", "success", "Success",
                         "Card added", "Response: Card added", "Status: Approved ✅", 
-                        "✅ Approved", "APPROVED✅
+                        "✅ Approved", "APPROVED✅"
                     ]
 
                     # DECLINED KEYWORDS
