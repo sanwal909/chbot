@@ -6,6 +6,7 @@ import sys
 import sqlite3
 import logging
 import time
+import threading
 from datetime import datetime
 from typing import List, Union
 from pyrogram.client import Client
@@ -46,21 +47,26 @@ class SessionBot:
     def __init__(self):
         self.user_states = {}
         self.monitoring_clients = {}
+        self.db_lock = threading.RLock()  # Reentrant lock for database operations
         self.setup_database()
 
     def setup_database(self):
         """Setup SQLite database for storing user sessions and processed messages"""
         db_path = os.path.join(DATA_DIR, 'bot_database.db')
         
-        # Enable WAL mode and increase timeout to prevent database locking issues
-        self.conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False, isolation_level=None)
+        # Use autocommit mode with WAL for best concurrency
+        # isolation_level=None enables autocommit - prevents hanging transactions
+        self.conn = sqlite3.connect(db_path, timeout=60.0, check_same_thread=False, isolation_level=None)
         self.cursor = self.conn.cursor()
         
         # Enable WAL (Write-Ahead Logging) mode for better concurrent access
         self.cursor.execute('PRAGMA journal_mode=WAL')
-        self.cursor.execute('PRAGMA busy_timeout=30000')
+        self.cursor.execute('PRAGMA busy_timeout=60000')  # 60 seconds
+        self.cursor.execute('PRAGMA synchronous=NORMAL')  # Faster writes, still safe with WAL
+        self.cursor.execute('PRAGMA cache_size=-64000')  # 64MB cache
+        self.cursor.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp tables
         
-        logger.info(f"Database connected at: {db_path} with WAL mode enabled")
+        logger.info(f"Database connected at: {db_path} with WAL mode and optimizations enabled")
         
         # Sessions table - supports multiple accounts per user
         self.cursor.execute('''
@@ -109,25 +115,72 @@ class SessionBot:
         self.conn.commit()
         logger.info("Database setup completed")
 
-    def get_active_session(self, user_id):
+    async def safe_db_execute(self, query, params=(), commit=False, fetchone=False, fetchall=False, max_retries=3):
+        """Execute database query with async retry logic to prevent locks"""
+        for attempt in range(max_retries):
+            try:
+                with self.db_lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute(query, params)
+                    
+                    # With isolation_level=None (autocommit), explicit commits are no-ops
+                    # but we keep the parameter for clarity and future flexibility
+                    if commit:
+                        try:
+                            self.conn.commit()
+                        except:
+                            pass  # In autocommit mode, commit() does nothing
+                    
+                    if fetchone:
+                        return cursor.fetchone()
+                    elif fetchall:
+                        return cursor.fetchall()
+                    elif not commit:
+                        # Return lastrowid for INSERT operations
+                        return cursor.lastrowid
+                    return True
+                    
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.5  # Exponential backoff: 0.5s, 1s, 1.5s
+                    logger.warning(f"Database locked, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)  # Use asyncio.sleep to not block event loop
+                else:
+                    # Ensure database is not left in bad state
+                    try:
+                        self.conn.rollback()
+                    except:
+                        pass
+                    logger.error(f"Database error after {attempt + 1} attempts: {e}")
+                    raise
+            except Exception as e:
+                # Rollback on any error to prevent hanging transactions
+                try:
+                    self.conn.rollback()
+                except:
+                    pass
+                logger.error(f"Database error: {e}")
+                raise
+        
+        return None
+
+    async def get_active_session(self, user_id):
         """Get active session for a user"""
-        self.cursor.execute('''
+        return await self.safe_db_execute('''
             SELECT session_id, session_name, api_id, api_hash, phone, session_file, 
                    target_group, source_channels, checker_bot, wait_for_reply, next_post_delay
             FROM sessions 
             WHERE user_id = ? AND is_active = 1
-        ''', (user_id,))
-        return self.cursor.fetchone()
+        ''', (user_id,), fetchone=True)
 
-    def get_session_by_name(self, user_id, session_name):
+    async def get_session_by_name(self, user_id, session_name):
         """Get session by name for a user"""
-        self.cursor.execute('''
+        return await self.safe_db_execute('''
             SELECT session_id, session_name, api_id, api_hash, phone, session_file,
                    target_group, source_channels, checker_bot, wait_for_reply, next_post_delay
             FROM sessions 
             WHERE user_id = ? AND session_name = ?
-        ''', (user_id, session_name))
-        return self.cursor.fetchone()
+        ''', (user_id, session_name), fetchone=True)
     
     def get_session_path(self, session_file):
         """Get full session path for Telethon - Telethon adds .session automatically"""
@@ -208,7 +261,7 @@ class SessionBot:
                         return
                     
                     # Get active session
-                    active_session = self.get_active_session(user_id)
+                    active_session = await self.get_active_session(user_id)
                     if not active_session:
                         await message.reply("❌ No active session!\n\nUse /sessions to view accounts\nUse /switch SESSION_NAME to activate one")
                         return
@@ -224,12 +277,11 @@ class SessionBot:
                     source_channels = f"{source_ch1},{source_ch2}"
                     
                     # Update config for active session
-                    self.cursor.execute('''
+                    await self.safe_db_execute('''
                         UPDATE sessions 
                         SET target_group = ?, source_channels = ?, checker_bot = ?
                         WHERE session_id = ?
-                    ''', (target_group, source_channels, checker_bot, session_id))
-                    self.conn.commit()
+                    ''', (target_group, source_channels, checker_bot, session_id), commit=True)
                     
                     config_msg = (
                         f"✅ Configuration Saved for '{session_name}'!\n\n"
@@ -250,7 +302,7 @@ class SessionBot:
                 user_id = message.from_user.id
                 
                 # Get active session
-                active_session = self.get_active_session(user_id)
+                active_session = await self.get_active_session(user_id)
                 if not active_session:
                     await message.reply("❌ No active session!\n\nUse /sessions to view accounts\nUse /switch SESSION_NAME to activate one")
                     return
@@ -282,11 +334,10 @@ class SessionBot:
                 user_id = message.from_user.id
                 
                 # Get all configured sessions (not just active one)
-                self.cursor.execute('''
+                all_sessions = await self.safe_db_execute('''
                     SELECT session_id, session_name, target_group, source_channels, session_file
                     FROM sessions WHERE user_id = ?
-                ''', (user_id,))
-                all_sessions = self.cursor.fetchall()
+                ''', (user_id,), fetchall=True)
                 
                 if not all_sessions:
                     await message.reply("❌ No sessions found!\n\nCreate sessions first")
@@ -329,7 +380,7 @@ class SessionBot:
                 user_id = message.from_user.id
                 
                 # Get active session
-                active_session = self.get_active_session(user_id)
+                active_session = await self.get_active_session(user_id)
                 if not active_session:
                     await message.reply("❌ No active session!")
                     return
@@ -354,16 +405,14 @@ class SessionBot:
                 user_id = message.from_user.id
                 
                 # Get active session
-                self.cursor.execute('SELECT session_id FROM sessions WHERE user_id = ? AND is_active = 1', (user_id,))
-                active = self.cursor.fetchone()
+                active = await self.safe_db_execute('SELECT session_id FROM sessions WHERE user_id = ? AND is_active = 1', (user_id,), fetchone=True)
                 
                 if not active:
                     await message.reply("❌ No active session!\n\nUse /sessions to view and /switch to activate")
                     return
                 
                 session_id = active[0]
-                self.cursor.execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,))
-                stats = self.cursor.fetchone()
+                stats = await self.safe_db_execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,), fetchone=True)
                 
                 if stats:
                     stats_msg = (
@@ -380,8 +429,7 @@ class SessionBot:
                 """List all sessions for user"""
                 user_id = message.from_user.id
                 
-                self.cursor.execute('SELECT session_id, session_name, phone, is_active FROM sessions WHERE user_id = ?', (user_id,))
-                sessions = self.cursor.fetchall()
+                sessions = await self.safe_db_execute('SELECT session_id, session_name, phone, is_active FROM sessions WHERE user_id = ?', (user_id,), fetchall=True)
                 
                 if not sessions:
                     await message.reply("❌ No sessions found!\n\nAdd a new account:\nSESSION_NAME API_ID API_HASH PHONE_NUMBER")
@@ -409,19 +457,17 @@ class SessionBot:
                 session_name = parts[1]
                 
                 # Check if session exists
-                self.cursor.execute('SELECT session_id FROM sessions WHERE user_id = ? AND session_name = ?', (user_id, session_name))
-                session = self.cursor.fetchone()
+                session = await self.safe_db_execute('SELECT session_id FROM sessions WHERE user_id = ? AND session_name = ?', (user_id, session_name), fetchone=True)
                 
                 if not session:
                     await message.reply(f"❌ Session '{session_name}' not found!\n\nUse /sessions to view all accounts")
                     return
                 
                 # Deactivate all sessions for this user
-                self.cursor.execute('UPDATE sessions SET is_active = 0 WHERE user_id = ?', (user_id,))
+                await self.safe_db_execute('UPDATE sessions SET is_active = 0 WHERE user_id = ?', (user_id,), commit=True)
                 
                 # Activate selected session
-                self.cursor.execute('UPDATE sessions SET is_active = 1 WHERE user_id = ? AND session_name = ?', (user_id, session_name))
-                self.conn.commit()
+                await self.safe_db_execute('UPDATE sessions SET is_active = 1 WHERE user_id = ? AND session_name = ?', (user_id, session_name), commit=True)
                 
                 await message.reply(f"✅ Active account switched to: {session_name}")
 
@@ -438,8 +484,7 @@ class SessionBot:
                 session_name = parts[1]
                 
                 # Check if session exists
-                self.cursor.execute('SELECT session_id, session_file FROM sessions WHERE user_id = ? AND session_name = ?', (user_id, session_name))
-                session = self.cursor.fetchone()
+                session = await self.safe_db_execute('SELECT session_id, session_file FROM sessions WHERE user_id = ? AND session_name = ?', (user_id, session_name), fetchone=True)
                 
                 if not session:
                     await message.reply(f"❌ Session '{session_name}' not found!")
@@ -448,10 +493,9 @@ class SessionBot:
                 session_id, session_file = session
                 
                 # Delete from database
-                self.cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
-                self.cursor.execute('DELETE FROM session_stats WHERE session_id = ?', (session_id,))
-                self.cursor.execute('DELETE FROM processed_messages WHERE session_id = ?', (session_id,))
-                self.conn.commit()
+                await self.safe_db_execute('DELETE FROM sessions WHERE session_id = ?', (session_id,), commit=True)
+                await self.safe_db_execute('DELETE FROM session_stats WHERE session_id = ?', (session_id,), commit=True)
+                await self.safe_db_execute('DELETE FROM processed_messages WHERE session_id = ?', (session_id,), commit=True)
                 
                 # Delete session file (Telethon adds .session extension)
                 try:
@@ -510,7 +554,7 @@ class SessionBot:
                 return
 
             # Check if session name already exists
-            if self.get_session_by_name(user_id, session_name):
+            if await self.get_session_by_name(user_id, session_name):
                 await message.reply(f"❌ Session '{session_name}' already exists!\n\nUse a different name or delete the existing one with /delete {session_name}")
                 return
 
@@ -663,27 +707,23 @@ class SessionBot:
             await user_client.disconnect()
 
             # Save to sessions table (store the base name without .session extension)
-            self.cursor.execute('''
+            session_id = await self.safe_db_execute('''
                 INSERT INTO sessions 
                 (user_id, session_name, api_id, api_hash, phone, session_file, wait_for_reply, next_post_delay, is_active) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, session_name, api_id, api_hash, phone, session_file_base, DEFAULT_WAIT_FOR_REPLY, DEFAULT_NEXT_POST_DELAY, 1))
             
-            session_id = self.cursor.lastrowid
-            
             # Initialize stats for this session
-            self.cursor.execute('''
+            await self.safe_db_execute('''
                 INSERT INTO session_stats (session_id, posted_count, pinned_count)
                 VALUES (?, 0, 0)
-            ''', (session_id,))
+            ''', (session_id,), commit=True)
             
             # Deactivate other sessions for this user (make this the active one)
-            self.cursor.execute('''
+            await self.safe_db_execute('''
                 UPDATE sessions SET is_active = 0 
                 WHERE user_id = ? AND session_id != ?
-            ''', (user_id, session_id))
-            
-            self.conn.commit()
+            ''', (user_id, session_id), commit=True)
 
             # Send success message
             success_msg = (
@@ -746,35 +786,33 @@ class SessionBot:
         match = re.search(cc_pattern, text)
         return match.group(1) if match else None
 
-    def is_message_processed(self, session_id, message_signature):
+    async def is_message_processed(self, session_id, message_signature):
         """Check if message was already processed - uses database"""
-        self.cursor.execute('''
+        result = await self.safe_db_execute('''
             SELECT id FROM processed_messages 
             WHERE session_id = ? AND message_signature = ?
-        ''', (session_id, message_signature))
-        return self.cursor.fetchone() is not None
+        ''', (session_id, message_signature), fetchone=True)
+        return result is not None
 
-    def mark_message_processed(self, session_id, message_signature, cc_details, status):
-        """Mark message as processed - uses database"""
+    async def mark_message_processed(self, session_id, message_signature, cc_details, status):
+        """Mark message as processed - uses database with retry logic"""
         try:
-            self.cursor.execute('''
+            await self.safe_db_execute('''
                 INSERT OR REPLACE INTO processed_messages 
                 (session_id, message_signature, cc_details, status, pinned, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (session_id, message_signature, cc_details, status, 1 if status == 'approved' else 0, datetime.now().isoformat()))
-            self.conn.commit()
+            ''', (session_id, message_signature, cc_details, status, 1 if status == 'approved' else 0, datetime.now().isoformat()), commit=True)
         except Exception as e:
             logger.error(f"Error marking message: {e}")
 
-    def update_stats(self, session_id, posted=0, pinned=0):
-        """Update session stats"""
+    async def update_stats(self, session_id, posted=0, pinned=0):
+        """Update session stats with retry logic"""
         try:
-            self.cursor.execute('''
+            await self.safe_db_execute('''
                 UPDATE session_stats 
                 SET posted_count = posted_count + ?, pinned_count = pinned_count + ?
                 WHERE session_id = ?
-            ''', (posted, pinned, session_id))
-            self.conn.commit()
+            ''', (posted, pinned, session_id), commit=True)
         except Exception as e:
             logger.error(f"Error updating stats: {e}")
 
@@ -837,7 +875,7 @@ class SessionBot:
         try:
             # Send message to bot
             sent_message = await telethon_client.send_message(target_group, f"/chk {cc_details}")
-            self.update_stats(session_id, posted=1, pinned=0)
+            await self.update_stats(session_id, posted=1, pinned=0)
             
             logger.info(f"[Session {session_id}] Sent: {cc_details}")
 
@@ -873,7 +911,7 @@ class SessionBot:
                         # Pin both the bot reply AND the original CC message
                         success = await self.pin_approved_message(telethon_client, target_group, message, sent_message)
                         if success:
-                            self.update_stats(session_id, posted=0, pinned=1)
+                            await self.update_stats(session_id, posted=0, pinned=1)
                             return "approved"
                         return "approved_but_pin_failed"
 
@@ -904,10 +942,10 @@ class SessionBot:
                 message_signature = f"{channel_id}_{message.id}"
                 cc_details = self.extract_cc_details(text)
 
-                if cc_details and not self.is_message_processed(session_id, message_signature):
+                if cc_details and not await self.is_message_processed(session_id, message_signature):
                     logger.info(f"[Session {session_id}] Found CC: {cc_details}")
                     result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_time)
-                    self.mark_message_processed(session_id, message_signature, cc_details, result)
+                    await self.mark_message_processed(session_id, message_signature, cc_details, result)
                     await asyncio.sleep(delay_time)
                     message_count += 1
 
@@ -921,12 +959,11 @@ class SessionBot:
     async def start_monitoring(self, session_id):
         """Start monitoring channels using Telethon - PERSISTENT with auto-reconnect"""
         # Get session data from database ONCE
-        self.cursor.execute('''
+        session_data = await self.safe_db_execute('''
             SELECT user_id, session_name, api_id, api_hash, phone, session_file, 
                    target_group, source_channels, checker_bot, wait_for_reply, next_post_delay
             FROM sessions WHERE session_id = ?
-        ''', (session_id,))
-        session_data = self.cursor.fetchone()
+        ''', (session_id,), fetchone=True)
         
         if not session_data:
             logger.error(f"Session {session_id} not found!")
@@ -991,7 +1028,7 @@ class SessionBot:
                             return
 
                         message_signature = f"{chat_id}_{message.id}"
-                        if self.is_message_processed(session_id, message_signature):
+                        if await self.is_message_processed(session_id, message_signature):
                             return
 
                         cc_details = self.extract_cc_details(text)
@@ -999,7 +1036,7 @@ class SessionBot:
                             logger.info(f"[Session {session_id}] New CC found: {cc_details}")
                             try:
                                 result = await self.send_and_wait_for_reply(session_id, telethon_client, target_group, cc_details, wait_for_reply)
-                                self.mark_message_processed(session_id, message_signature, cc_details, result)
+                                await self.mark_message_processed(session_id, message_signature, cc_details, result)
                                 await asyncio.sleep(next_post_delay)
                             except Exception as process_error:
                                 logger.error(f"[Session {session_id}] Processing error: {process_error}")
@@ -1013,8 +1050,7 @@ class SessionBot:
                         await self.process_source_channel(session_id, telethon_client, target_group, channel_id, wait_for_reply, next_post_delay)
                 
                 # Get current stats
-                self.cursor.execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,))
-                stats = self.cursor.fetchone()
+                stats = await self.safe_db_execute('SELECT * FROM session_stats WHERE session_id = ?', (session_id,), fetchone=True)
                 if stats:
                     logger.info(f"[Session {session_id}] Stats - Posted: {stats[1]}, Pinned: {stats[2]}")
                 
@@ -1023,19 +1059,63 @@ class SessionBot:
                 # Reset reconnect delay on successful connection
                 reconnect_delay = 5
                 
-                # Keep client running - will return when disconnected
-                await telethon_client.run_until_disconnected()
+                # Create background task for keepalive pings (prevents timeout)
+                async def keepalive():
+                    """Send periodic pings to keep connection alive"""
+                    while telethon_client.is_connected():
+                        try:
+                            await asyncio.sleep(300)  # Ping every 5 minutes
+                            if telethon_client.is_connected():
+                                await telethon_client.get_me()  # Simple ping
+                                logger.debug(f"[Session {session_id}] Keepalive ping sent")
+                        except Exception as e:
+                            logger.warning(f"[Session {session_id}] Keepalive failed: {e}")
+                            break
+                
+                # Start keepalive task
+                keepalive_task = asyncio.create_task(keepalive())
+                
+                try:
+                    # Keep client running - will return when disconnected
+                    await telethon_client.run_until_disconnected()
+                finally:
+                    # Cancel keepalive when client disconnects
+                    keepalive_task.cancel()
+                    try:
+                        await keepalive_task
+                    except asyncio.CancelledError:
+                        pass
                 
                 # If we reach here, client disconnected (normal after ~2 hours)
                 logger.warning(f"[Session {session_id}] Client disconnected, will auto-reconnect in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
                 
             except Exception as e:
-                logger.error(f"[Session {session_id}] Monitoring error: {e}")
+                logger.error(f"[Session {session_id}] Monitoring error: {e}", exc_info=True)
+                
+                # Cleanup current client if it exists
+                if session_id in self.monitoring_clients and self.monitoring_clients[session_id]:
+                    try:
+                        await self.monitoring_clients[session_id].disconnect()
+                    except:
+                        pass
                 
                 # Exponential backoff for reconnect (max 60s)
                 reconnect_delay = min(reconnect_delay * 2, 60)
                 logger.info(f"[Session {session_id}] Will retry in {reconnect_delay}s...")
+                
+                # Notify user on repeated failures
+                if reconnect_delay >= 30:
+                    try:
+                        await self.client.send_message(
+                            user_id, 
+                            f"⚠️ '{session_name}' experiencing connection issues.\n"
+                            f"Auto-reconnecting in {reconnect_delay}s...\n"
+                            f"(This is normal - monitoring will resume automatically)"
+                        )
+                    except:
+                        pass
+                
                 await asyncio.sleep(reconnect_delay)
         
         # Only cleanup when /stop is called
