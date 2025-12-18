@@ -1,6 +1,2 @@
-pyrogram==2.0.106
-tgcrypto==1.2.5
-pyrogram
-tgcrypto
-telethon
-aiosqlite
+requests==2.32.5
+flask==3.0.0
